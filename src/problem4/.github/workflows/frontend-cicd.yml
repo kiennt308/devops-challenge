@@ -1,0 +1,212 @@
+name: Frontend CI/CD (Static SPA -> AWS S3 + CloudFront)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - "scripts/deploy-s3-frontend.sh"
+      - ".github/workflows/frontend-cicd.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - "scripts/deploy-s3-frontend.sh"
+      - ".github/workflows/frontend-cicd.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      rollback_release_sha:
+        description: "Optional commit SHA to instantly restore from S3 release archive"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  NODE_VERSION: "20"
+  WORKING_DIR: ./frontend
+
+jobs:
+  # ============================================================================
+  # 1. QUALITY, TEST & BUILD ARTIFACT (Build-once; skipped on instant rollback)
+  # ============================================================================
+  quality-and-build:
+    name: Lint, Test & Build SPA Bundle
+    if: github.event_name != 'workflow_dispatch' || inputs.rollback_release_sha == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
+
+      - name: Install deterministic dependencies
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm ci
+
+      - name: Lint & Typecheck
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          npm run lint
+          npm run typecheck --if-present
+
+      - name: Audit production dependencies
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Run unit & component tests
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm test -- --run
+
+      - name: Build production SPA bundle
+        if: inputs.rollback_release_sha == ''
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          # Runtime config is loaded via /config.json per environment so the compiled
+          # JS/CSS bundle remains environment-agnostic and strictly immutable.
+          VITE_APP_VERSION: ${{ github.sha }}
+        run: npm run build
+
+      - name: Upload compiled dist/ artifact
+        if: inputs.rollback_release_sha == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: ${{ env.WORKING_DIR }}/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ============================================================================
+  # 2. DEPLOY TO STAGING S3 + CLOUDFRONT
+  # ============================================================================
+  deploy-staging:
+    name: Deploy SPA to Staging S3 & CloudFront
+    needs: [quality-and-build]
+    if: |
+      always() &&
+      (
+        needs.quality-and-build.result == 'success' ||
+        (github.event_name == 'workflow_dispatch' && inputs.rollback_release_sha != '')
+      ) &&
+      (github.event_name == 'push' || inputs.environment == 'staging')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: staging
+      url: https://staging.example.com
+    concurrency:
+      group: frontend-deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout deployment scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+
+      - name: Download compiled SPA bundle
+        if: inputs.rollback_release_sha == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: ./dist
+
+      - name: Configure AWS credentials via OIDC (Staging Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_STAGING_FRONTEND_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Atomic Two-Phase S3 Sync & CloudFront Invalidation
+        env:
+          S3_BUCKET: ${{ vars.STAGING_S3_BUCKET }}
+          CF_DISTRIBUTION_ID: ${{ vars.STAGING_CF_DISTRIBUTION_ID }}
+          API_BASE_URL: https://api.staging.example.com
+          RELEASE_SHA: ${{ github.sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_release_sha }}
+        run: |
+          chmod +x ./scripts/deploy-s3-frontend.sh
+          ./scripts/deploy-s3-frontend.sh
+
+  # ============================================================================
+  # 3. DEPLOY TO PRODUCTION S3 + CLOUDFRONT
+  # ============================================================================
+  deploy-production:
+    name: Deploy SPA to Production S3 & CloudFront
+    needs: [quality-and-build, deploy-staging]
+    if: |
+      always() &&
+      (
+        (github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.environment == 'production' &&
+          (needs.quality-and-build.result == 'success' || inputs.rollback_release_sha != '')
+        )
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: https://app.example.com
+    concurrency:
+      group: frontend-deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout deployment scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+
+      - name: Download compiled SPA bundle
+        if: inputs.rollback_release_sha == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: ./dist
+
+      - name: Configure AWS credentials via OIDC (Production Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_PROD_FRONTEND_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Atomic Two-Phase S3 Sync & CloudFront Invalidation
+        env:
+          S3_BUCKET: ${{ vars.PROD_S3_BUCKET }}
+          CF_DISTRIBUTION_ID: ${{ vars.PROD_CF_DISTRIBUTION_ID }}
+          API_BASE_URL: https://api.example.com
+          RELEASE_SHA: ${{ github.sha }}
+          ROLLBACK_SHA: ${{ inputs.rollback_release_sha }}
+        run: |
+          chmod +x ./scripts/deploy-s3-frontend.sh
+          ./scripts/deploy-s3-frontend.sh
+

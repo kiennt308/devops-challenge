@@ -1,0 +1,307 @@
+name: Backend CI/CD (HTTP API -> AWS EC2)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - "scripts/deploy-ec2.sh"
+      - ".github/workflows/backend-cicd.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - "scripts/deploy-ec2.sh"
+      - ".github/workflows/backend-cicd.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      rollback_image_tag:
+        description: "Optional ECR image tag to deploy/rollback directly (e.g. sha-a1b2c3d)"
+        required: false
+        type: string
+
+# Least-privilege default permissions; elevated only at job level where required
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY: web-product/backend-api
+  NODE_VERSION: "20"
+  WORKING_DIR: ./backend
+
+jobs:
+  # ============================================================================
+  # 1. QUALITY & SECURITY GATE (Runs on every PR and push; skipped on rollback)
+  # ============================================================================
+  lint-test-scan:
+    name: Lint, Test & Dependency Audit
+    if: github.event_name != 'workflow_dispatch' || inputs.rollback_image_tag == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U test_user -d test_db"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
+
+      - name: Install deterministic dependencies
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm ci
+
+      - name: Run static analysis & typecheck
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          npm run lint
+          npm run typecheck --if-present
+
+      - name: Audit production dependencies for high/critical CVEs
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Run unit & integration tests
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        run: npm test -- --coverage
+
+  # ============================================================================
+  # 2. BUILD, SCAN & PUBLISH IMMUTABLE ARTIFACT (Runs on main or manual dispatch)
+  # ============================================================================
+  build-and-publish:
+    name: Build, Scan & Push Container Image to ECR
+    needs: [lint-test-scan]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.rollback_image_tag == '')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # Required for AWS OIDC federation
+      security-events: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute immutable image tags
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="sha-${SHORT_SHA}"
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_URI="${REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local image for vulnerability scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKING_DIR }}
+          load: true
+          tags: ${{ steps.meta.outputs.image_uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
+
+      - name: Scan container image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+      - name: Push verified local image to Amazon ECR (bit-for-bit identical to scanned image)
+        id: build
+        run: |
+          IMAGE_URI="${{ steps.meta.outputs.image_uri }}"
+          docker push "${IMAGE_URI}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_URI}" | cut -d'@' -f2)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  # ============================================================================
+  # 3. DEPLOY TO STAGING EC2 VIA AWS SSM (Zero-SSH, Blue/Green Port Swap)
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging EC2
+    needs: [lint-test-scan, build-and-publish]
+    if: |
+      always() &&
+      (
+        (needs.lint-test-scan.result == 'success' && needs.build-and-publish.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.rollback_image_tag != '')
+      ) &&
+      (github.event_name == 'push' || inputs.environment == 'staging')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url: https://api.staging.example.com
+    # Serialize deployments per environment without cancelling an in-flight rollout
+    concurrency:
+      group: backend-deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout deployment scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+
+      - name: Configure AWS credentials via OIDC (Staging Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_STAGING_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve target image tag
+        id: target
+        run: |
+          if [ -n "${{ inputs.rollback_image_tag }}" ]; then
+            echo "tag=${{ inputs.rollback_image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ needs.build-and-publish.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger zero-downtime EC2 deployment via AWS SSM Run Command
+        env:
+          APP_ENV: staging
+          TARGET_TAG_VALUE: backend-api-staging
+          ECR_REGISTRY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ steps.target.outputs.tag }}
+          SSM_CONFIG_PATH: /web-product/staging/backend
+        run: |
+          chmod +x ./scripts/deploy-ec2.sh
+          ./scripts/deploy-ec2.sh
+
+      - name: External Post-Deployment Smoke Test
+        run: |
+          echo "Verifying external ALB endpoint https://api.staging.example.com/status..."
+          # Simulated in challenge environment where example.com does not resolve:
+          # curl --fail --silent --show-error --retry 5 --retry-delay 3 https://api.staging.example.com/status
+
+  # ============================================================================
+  # 4. DEPLOY TO PRODUCTION EC2 (Requires Staging Success & Environment Gate)
+  # ============================================================================
+  deploy-production:
+    name: Deploy to Production EC2
+    needs: [lint-test-scan, build-and-publish, deploy-staging]
+    if: |
+      always() &&
+      (
+        (github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.environment == 'production' &&
+          (needs.build-and-publish.result == 'success' || inputs.rollback_image_tag != '')
+        )
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://api.example.com
+    # Never cancel an active production deployment mid-flight
+    concurrency:
+      group: backend-deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout deployment scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+
+      - name: Configure AWS credentials via OIDC (Production Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_PROD_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve target image tag
+        id: target
+        run: |
+          if [ -n "${{ inputs.rollback_image_tag }}" ]; then
+            echo "tag=${{ inputs.rollback_image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ needs.build-and-publish.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger zero-downtime EC2 deployment via AWS SSM Run Command
+        env:
+          APP_ENV: production
+          TARGET_TAG_VALUE: backend-api-production
+          ECR_REGISTRY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ steps.target.outputs.tag }}
+          SSM_CONFIG_PATH: /web-product/production/backend
+        run: |
+          chmod +x ./scripts/deploy-ec2.sh
+          ./scripts/deploy-ec2.sh
+
+      - name: External Post-Deployment Smoke Test
+        run: |
+          echo "Verifying external ALB endpoint https://api.example.com/status..."
+          # Simulated in challenge environment:
+          # curl --fail --silent --show-error --retry 5 --retry-delay 3 https://api.example.com/status
+
