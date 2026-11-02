@@ -96,7 +96,9 @@ aws s3 cp "${DIST_DIR}/config.json" "s3://${S3_BUCKET}/config.json" \
 
 for entry in index.html service-worker.js; do
   CONTENT_TYPE="text/html; charset=utf-8"
-  [[ "${entry}" == *.js ]] && CONTENT_TYPE="application/javascript; charset=utf-8"
+  if [[ "${entry}" == *.js ]]; then
+    CONTENT_TYPE="application/javascript; charset=utf-8"
+  fi
 
   if [ -n "${ROLLBACK_SHA}" ]; then
     aws s3 cp "${SOURCE_URI}/${entry}" "s3://${S3_BUCKET}/${entry}" \

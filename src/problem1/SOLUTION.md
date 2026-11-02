@@ -32,7 +32,7 @@ In a spot exchange like Binance, API traffic follows a known read/write distribu
 
 | Endpoint Category | Share | Baseline ($\lambda_{\text{base}}$) | Peak Burst ($\lambda_{\text{peak}}$) | Operations Triggered Per Request |
 | :--- | :--- | :--- | :--- | :--- |
-| **Write: Place / Cancel Order** (`POST/DELETE /api/v1/order`) | `30%` | `150 RPS` | `750 RPS` | `1` HMAC/Ed25519 verify + `1` Atomic Lua (`reserve_and_enqueue.lua`: lock balance + `XADD`) + `1` In-Memory Match + `1` Atomic Lua (`apply_match_result.lua`: settle/refund + `XADD` fill) + `WAIT 1 50` Cross-AZ ack + `PUBLISH` reply + `3` Ledger DB rows (async) |
+| **Write: Place / Cancel Order** (`POST/DELETE /api/v1/order`) | `30%` | `150 RPS` | `750 RPS` | `1` HMAC/Ed25519 verify + `1` Atomic Lua (`reserve_and_enqueue.lua`: lock balance + `XADD` with `min-replicas-to-write 1`) + `1` In-Memory Match + **Dual-Path Commit (`WAIT 1 50` Cross-AZ Redis ack + Synchronous Peer-to-Peer Warm-Standby Journal Ack over VPC TCP)** + `PUBLISH` reply + `3` Ledger DB rows (async) |
 | **Read: Hot State** (`OpenOrders`, `Balances`, `L2 Depth`, `RecentFills`) | `50%` | `250 RPS` | `1,250 RPS` | `1` Auth check + `1` Redis `HGETALL`/`ZRANGE` (`O(log N)`) |
 | **Read: Cold History** (`TradeHistory >5m`, `ClosedOrders`, `Klines`) | `20%` | `100 RPS` | `500 RPS` | `1` Indexed `SELECT` on Aurora PostgreSQL Read Replica (or CloudFront cache hit) |
 | **Total HTTP Ingress** | **`100%`** | **`500 RPS`** | **`2,500 RPS`** | — |
@@ -73,7 +73,7 @@ In a spot exchange like Binance, API traffic follows a known read/write distribu
     1. `1` unified atomic Lua script (`EVALSHA reserve_and_enqueue.lua`: atomically checks/locks balance + appends order to `stream:orders` in a single round-trip so a gateway crash can never leave orphaned locked funds),
     2. `1` stream read (`XREADGROUP`) by the Matching Engine,
     3. `1` unified atomic Lua script (`EVALSHA apply_match_result.lua`: settles Maker/Taker balances + refunds any price-improvement surplus + appends fill to `stream:fills` + caches recent trade for Read-Your-Own-Writes), and
-    4. `1` Cross-AZ replication barrier (`WAIT 1 50` executed right after `apply_match_result.lua` so the state mutation is confirmed on the Cross-AZ replica *before* firing `PUBLISH` to wake the waiting Order Gateway and WebSocket market data channel) = `4 Redis operations` per order on the Hot Path (plus `1` batched `XREADGROUP`/`XACK` every `20ms` by the Settlement Worker, adding `< 0.4 ops/order`).
+    4. `1` Dual-Path Cross-AZ replication barrier (`WAIT 1 50` on Redis executed concurrently with Direct VPC TCP Peer WAL replication to the Warm-Standby Matching Engine in AZ-b, confirming durability across both engines *before* firing `PUBLISH` to wake the waiting Order Gateway and WebSocket market data channel) = `4 Redis operations` per order on the Hot Path (plus `1` batched `XREADGROUP`/`XACK` every `20ms` by the Settlement Worker, adding `< 0.4 ops/order`).
   * Every hot read (`250 RPS` base / `1,250 RPS` peak) executes `1 Redis op`.
   * **Total Redis Throughput:**
     $$\text{Ops}_{\text{base}} = (150 \times 4) + 250 = \mathbf{850 \text{ ops/sec}} \quad | \quad \text{Ops}_{\text{peak}} = (750 \times 4) + 1,250 = \mathbf{4,250 \text{ ops/sec}}$$
@@ -124,7 +124,7 @@ Let us plug in the exact numbers for every component on the **Hot Path** under b
 | **2** | **Order Gateway Compute** (ECS Fargate, $S = 0.40\text{ ms}$, $\mu = 2,500/\text{vCPU}$) | `0.40 ms` | $\rho = 0.10$ | $\rho = 0.50$ | $4.605 \times \frac{0.40}{0.90} =$ **`2.05 ms`** | $4.605 \times \frac{0.40}{0.50} =$ **`3.68 ms`** |
 | **3** | **ElastiCache Redis Lua + Stream Append** ($S = 0.05\text{ ms}$ compute + `0.35 ms` VPC RTT) | `0.40 ms` | $\rho = 0.008$ | $\rho = 0.038$ | $4.605 \times \frac{0.05}{0.992} + 0.70 =$ **`0.93 ms`** | $4.605 \times \frac{0.05}{0.962} + 0.85 =$ **`1.09 ms`** |
 | **4** | **Matching Engine (`c7g.large`)** ($S = 0.05\text{ ms}$, $\mu = 20,000\text{ orders/s}$) | `0.05 ms` | $\rho = 0.0075$ | $\rho = 0.0375$ | $4.605 \times \frac{0.05}{0.9925} =$ **`0.23 ms`** | $4.605 \times \frac{0.05}{0.9625} =$ **`0.24 ms`** |
-| **5** | **Cross-AZ `WAIT 1 50` Replication Ack (`~0.55 ms` RTT) + Pub/Sub Reply & JSON Serialization** | `0.50 ms` | $\rho = 0.10$ | $\rho = 0.50$ | `0.55 ms` (Cross-AZ) + `1.25 ms` = **`1.80 ms`** | `0.70 ms` (Cross-AZ) + `2.40 ms` = **`3.10 ms`** |
+| **5** | **Dual-Path Cross-AZ Commit (`WAIT 1 50` + Peer WAL Ack, `~0.55 ms` RTT) + Pub/Sub Reply** | `0.50 ms` | $\rho = 0.10$ | $\rho = 0.50$ | `0.55 ms` (Cross-AZ) + `1.25 ms` = **`1.80 ms`** | `0.70 ms` (Cross-AZ) + `2.40 ms` = **`3.10 ms`** |
 | **Total** | **End-to-End `p99` Response Time** | — | — | — | **`20.01 ms` (`< 100ms` SLA)** | **`26.11 ms` (`< 100ms` SLA)** |
 
 > **Conclusion of Mathematical Proof (Comonotonic Upper Bound, Jackson Network Convolution & $G/G/c$ Volatility Headroom):**
@@ -166,9 +166,9 @@ flowchart LR
     %% 4. HOT PATH (IN-MEMORY < 30ms)
     subgraph T4 ["4. Hot Trading Core (In-Memory < 30ms)"]
         Redis["ElastiCache Redis 7 (Multi-AZ)\n- Atomic Lua Lock + Enqueue\n- Order Stream & Pub/Sub Reply"]
-        MatchActive["Matching Engine (Active)\nEC2 c7g.large (AZ-a)\nIn-Memory Order Book"]
-        MatchStandby["Matching Engine (Warm Standby)\nEC2 c7g.large (AZ-b)\nReal-Time Event Replay"]
-        DynamoLease[("DynamoDB Leader Lease\n(Strongly-Consistent Epoch Fencing)")]
+        MatchActive["Matching Engine (Active)\nEC2 c7g.large (AZ-a)\nIn-Memory Order Book + NVMe WAL"]
+        MatchStandby["Matching Engine (Warm Standby)\nEC2 c7g.large (AZ-b)\nReal-Time Replay + NVMe WAL"]
+        DynamoLease[("DynamoDB Leader Lease\n(Epoch Fencing + Committed Seq Watermark)")]
     end
 
     %% 5. COLD PATH (ASYNC PERSISTENCE)
@@ -191,9 +191,9 @@ flowchart LR
     %% Hot Path Flows
     OrderGW -- "1. Atomic Lua (Lock + XADD)" --> Redis
     Redis -- "2. Ordered Stream" --> MatchActive
-    Redis -. "2b. Sync Replay" .-> MatchStandby
-    MatchActive <-->|"2s Conditional Heartbeat"| DynamoLease
-    MatchStandby -.->|"Acquire Epoch+1 on Failover"| DynamoLease
+    MatchActive <-->|"2b. Direct Peer TCP Batch WAL Ack (<0.6ms)"| MatchStandby
+    MatchActive <-->|"2s Lease + Batch High-Watermark"| DynamoLease
+    MatchStandby -.->|"Acquire Epoch+1 & Reconcile Redis"| DynamoLease
     MatchActive -- "3. Atomic Lua (Settle + Fill + Pub/Sub)" --> Redis
     Redis -- "3b. Correlated Reply (gw:reply:id)" --> OrderGW
     Redis -- "4. Push Live Depth/Trades" --> WsGW
@@ -215,21 +215,27 @@ sequenceDiagram
     actor Trader as Trader / Bot
     participant GW as Order Gateway (ECS)
     participant Redis as ElastiCache Redis 7
-    participant ME as Matching Engine (EC2)
+    participant ME as Matching Engine (Active AZ-a)
+    participant Standby as Matching Engine (Standby AZ-b)
     participant WS as WebSocket Gateway
     participant Worker as Settlement Worker
     participant DB as Aurora PostgreSQL
 
     rect rgb(230, 245, 255)
-    Note over Trader,ME: SYNCHRONOUS HOT PATH (Target: p99 < 30ms, SLA: < 100ms)
+    Note over Trader,Standby: SYNCHRONOUS HOT PATH (Target: p99 < 30ms, SLA: < 100ms, Strict RPO = 0)
     Trader->>GW: POST /api/v1/order (Buy 0.5 BTC @ 60,000 USDT)
     GW->>GW: Register in-memory reply channel (req_id, 80ms timeout)
     GW->>Redis: EVALSHA reserve_and_enqueue.lua (Lock 30,000 USDT + XADD seq_id in 1 atomic op)
-    Redis->>ME: XREADGROUP Consume Order Command (seq_id)
-    ME->>ME: Match in RAM Limit Order Book (< 0.05ms, e.g. filled @ 59,000 USDT)
-    ME->>Redis: EVALSHA apply_match_result.lua -> WAIT 1 50 (Cross-AZ Ack) -> PUBLISH gw:reply
-    Redis-->>GW: Pub/Sub Push to gw:reply:<gw_id> (Sent only AFTER Cross-AZ WAIT Ack succeeds)
-    GW-->>Trader: 200 OK (Order Matched @ 59,000 USDT - Total ~15-26ms)
+    Redis->>ME: XREADGROUP Consume Order Command Batch (seq_id)
+    ME->>ME: Match in RAM Limit Order Book (< 0.05ms, e.g. filled @ 59,000 USDT) + Append Local WAL
+    par Dual-Path Synchronous Replication Barrier (~0.55ms Cross-AZ RTT)
+        ME->>Standby: Direct VPC TCP Replicate Batch (seq_id, cmd, fill_hash) -> Standby RAM + WAL Ack
+    and
+        ME->>Redis: EVALSHA apply_match_result.lua + WAIT 1 50 (Cross-AZ Replica Ack)
+    end
+    ME->>Redis: PUBLISH gw:reply:<gw_id> & md:<symbol> (ONLY after BOTH Standby & Redis Replica Ack!)
+    Redis-->>GW: Pub/Sub Push to gw:reply:<gw_id>
+    GW-->>Trader: 200 OK (Order Matched @ 59,000 USDT - Total ~15-26ms, Zero Rollback Risk)
     end
 
     rect rgb(240, 255, 240)
@@ -262,13 +268,16 @@ sequenceDiagram
      * **Atomic Stream Enqueue:** Assigns a strictly monotonic sequence number (`seq_id`) and calls `redis.call('XADD', 'stream:orders', ...)` **inside the exact same Lua script execution** (`< 0.5ms`).
 3. **Deterministic In-Memory Matching (`< 50 microseconds`):**
    * The **Matching Engine (`c7g.large`)** consumes the sequenced command via `XREADGROUP` and matches it against the in-memory Red-Black Tree / B-Tree Limit Order Book.
-4. **Atomic Post-Match Balance Settlement, Price-Improvement Refund, Cross-AZ Replication Barrier & Correlated Gateway Reply (`apply_match_result.lua` -> `WAIT 1 50` -> `PUBLISH`):**
+4. **Atomic Post-Match Balance Settlement, Price-Improvement Refund, Dual-Path Cross-AZ Commit Barrier & Correlated Gateway Reply (`apply_match_result.lua` + `Peer WAL Ack` -> `WAIT 1 50` -> `PUBLISH`):**
    * Immediately upon matching (for example, the `60,000 USDT` limit buy matches against a resting sell order at `59,000 USDT`), the Matching Engine invokes `EVALSHA apply_match_result.lua` on Redis:
      * **Fencing Verification:** Verifies `args.leader_epoch >= redis.get('current_leader_epoch')`, aborting if stale.
      * **Real-Time Taker & Maker Balance Update + Price-Improvement Refund:** Deducts `30,000 USDT` from the buyer's `locked_USDT`, **immediately refunds the `500 USDT` price-improvement savings** (`(60,000 - 59,000) * 0.5`) back to the buyer's `available_USDT`, credits `+0.5 BTC` (minus fee) to the buyer's `available_BTC`, and credits `+29,500 USDT` (minus fee) to the seller's `available_USDT`. Both traders can immediately use their new balances on their very next millisecond request!
      * **Read-Your-Own-Writes Cache & Durable Fill Stream:** Appends the fill event to `stream:fills` and pushes a compact record to `user:{id}:recent_fills` (5-minute TTL ring buffer) so immediate calls to `GET /api/v1/myTrades` or `OpenOrders` reflect the trade with **zero replication lag** while Aurora settles asynchronously.
-     * **Cross-AZ Replication Barrier Before Gateway Wakeup (`WAIT 1 50` -> `PUBLISH`):** Crucially, `PUBLISH` is **not** called inside `apply_match_result.lua` before replication completes (otherwise Redis Pub/Sub would wake the Order Gateway and return HTTP `200 OK` to the client *before* the state mutation is replicated to the standby AZ). Instead, the command pipeline executes `EVALSHA apply_match_result.lua`, blocks on `WAIT 1 50` (`~0.5ms` Cross-AZ memory replication acknowledgment), and **only after `WAIT 1 50` confirms that at least 1 Cross-AZ replica has acknowledged the write offset** does it execute `PUBLISH gw:reply:{gw_id}` and `PUBLISH md:{symbol}`.
-   * The waiting **Order Gateway** coroutine wakes up upon receiving the `gw:reply:{gw_id}` payload and returns HTTP `200 OK` to the trader, guaranteeing that every acknowledged `200 OK` trade has already survived Cross-AZ replication. Total end-to-end elapsed time: **`~15–26ms`**.
+     * **Dual-Path Synchronous Commit Barrier Before Gateway Wakeup (`Peer WAL Ack` + `Redis WAIT 1 50` -> `PUBLISH`):** Why is Redis `WAIT 1 50` alone insufficient for a financial exchange? Because Redis replication is not a strict Raft/Paxos consensus quorum—if the ElastiCache Primary node suffers a sudden power loss or network partition before flushing an in-flight replication buffer, an asynchronous Redis failover could promote a replica missing the last few milliseconds of stream entries. To eliminate even a 1-micro-batch rollback risk **without** adding latency:
+       1. **Redis Split-Brain Isolation (`min-replicas-to-write 1`, `min-replicas-max-lag 1`):** Configured in the ElastiCache parameter group so an isolated Redis Primary immediately rejects writes if it loses contact with its Cross-AZ replica.
+       2. **Parallel Peer-to-Peer Warm-Standby Journal Replication (`~0.5ms` Cross-AZ TCP):** In parallel with executing `EVALSHA apply_match_result.lua` + `WAIT 1 50` on Redis, the Active Matching Engine streams the deterministic micro-batch `(leader_epoch, seq_id, order_cmd, fill_result)` directly over a persistent Cross-AZ VPC TCP socket to the **Warm Standby Matching Engine (AZ-b)**, which applies the transition in RAM and appends it to its local `O_DSYNC` EBS/NVMe Write-Ahead Log (WAL) before returning an ACK.
+       3. **2-of-2 Cross-AZ Barrier Before `PUBLISH`:** Crucially, `PUBLISH gw:reply:{gw_id}` and `PUBLISH md:{symbol}` are fired **only after BOTH** `WAIT 1 50` (Redis Replica in AZ-b) **and** the **Warm Standby Matching Engine (AZ-b)** have acknowledged the micro-batch. Because both network paths run concurrently in the same `~0.55ms` Cross-AZ RTT window, `p99` latency remains unchanged (`~20.01ms` at 500 RPS).
+   * The waiting **Order Gateway** coroutine wakes up upon receiving the `gw:reply:{gw_id}` payload and returns HTTP `200 OK` to the trader, mathematically guaranteeing that every acknowledged `200 OK` trade resides in at least **two independent AZs and two independent storage engines** (Redis Primary/Replica + Matching Engine Active/Standby WAL). Total end-to-end elapsed time: **`~15–26ms`**.
 
 ### 4.2. Asynchronous Settlement, Poison-Pill Isolation & Read-Your-Own-Writes (`Cold Path`)
 1. **Settlement Workers (ECS Fargate)** consume `OrderFilled` and `OrderCanceled` events from `stream:fills` via `XREADGROUP` in micro-batches (every `20ms` or `100 events`).
@@ -288,7 +297,12 @@ sequenceDiagram
   * **Periodic Order Book Snapshots for Resting Multi-Day GTC Orders (Cold-Boot Recovery):**
     * Because the Redis Stream keeps a rolling 24-hour buffer (`3.88 GB`), what happens to **Good-Till-Canceled (GTC) limit orders** placed days or weeks ago if both Matching Engine instances ever restart simultaneously?
     * Every **60 seconds** (and on `SIGTERM` graceful shutdown), the **Warm Standby** serializes a binary snapshot of the in-memory Order Book (tagged with `snapshot_seq_id`) to **Amazon S3** (and local EBS) without impacting the Active node's latency. On a cold boot, a new Matching Engine loads the latest S3 snapshot in `< 50ms` and replays only the delta events (`seq_id > snapshot_seq_id`) from the Redis Stream, restoring 100% of historical resting GTC orders in under 1 second.
-  * **ElastiCache Redis Multi-AZ Failover Behavior & `WAIT` Replication Semantics:** Note that Redis `WAIT 1 50` enforces synchronous Cross-AZ memory replication acknowledgment under normal operation (pipelined once per opportunistic micro-batch), though Redis replication is not a strict Raft/Paxos consensus quorum. If the ElastiCache Primary node suffers a sudden hardware failure before flushing an in-flight batch, ElastiCache Multi-AZ automatically promotes the cross-AZ replica and updates DNS within `~10–25 seconds`. Upon promotion, the Matching Engine reconciles the highest `seq_id` present in the promoted Redis stream against its in-memory state before resuming order intake, while any un-acknowledged tail request that timed out at the Order Gateway is safely retried by the client using its deterministic idempotency key (`client_order_id`).
+  * **Eliminating Redis `WAIT` Non-Raft Rollback Risk via Dual-Path Synchronous WAL & Forward Roll-Forward Reconciliation (`RPO = 0`):**
+    * **Why `WAIT 1 50` Alone Is Not Enough:** Redis `WAIT 1 50` enforces synchronous Cross-AZ memory replication acknowledgment under normal operation, but Redis replication is not a strict Raft/Paxos consensus quorum. If the ElastiCache Primary node suffers a sudden hardware failure or split-brain partition while an in-flight batch is only partially replicated, ElastiCache Multi-AZ promotion (`~10–25s`) could promote a replica whose stream offset (`redis_seq_id`) lags behind the Matching Engine's committed state (`wal_seq_id`)—or whose `reserve_and_enqueue.lua` pre-trade lock was acknowledged on the old Primary before reaching the Replica.
+    * **How Our 3-Layer Protocol Eliminates Rollbacks Completely:**
+      1. **Pre-Trade Split-Brain Prevention (`min-replicas-to-write 1`, `min-replicas-max-lag 1`):** Configured on ElastiCache so a partitioned Redis Primary immediately halts new `reserve_and_enqueue.lua` writes if its Cross-AZ replica falls behind by `> 1s`. Furthermore, `reserve_and_enqueue.lua` returns the assigned `seq_id` to the Order Gateway, which pipelines `WAIT 1 50` before waiting on `gw:reply:{gw_id}`—ensuring even the initial balance lock is replicated across AZs.
+      2. **Synchronous Peer-to-Peer Warm-Standby WAL (`O_DSYNC` EBS/NVMe Journal):** Because every matched micro-batch must be acknowledged by **both** the Redis Replica (`WAIT 1 50`) **and** the Warm Standby Matching Engine's local `O_DSYNC` Write-Ahead Log (`wal_seq_id`) before `PUBLISH gw:reply:{gw_id}` returns HTTP `200 OK` to any trader, both Matching Engine nodes (AZ-a and AZ-b) hold an authoritative, durable, cryptographically hash-chained journal of every committed order and fill. Additionally, the Matching Engine piggybacks its latest `committed_seq_id` and `state_hash` onto its `500ms` **DynamoDB** leader heartbeat (`exchange_leader_lease`).
+      3. **Forward Roll-Forward Reconciliation on Redis Failover (Never Roll Back!):** If ElastiCache fails over to the Replica and the newly promoted Redis instance reports `redis_seq_id < wal_seq_id` (missing a tail micro-batch that was already acknowledged to a trader, or missing a post-match `apply_match_result.lua` execution), the Matching Engine **never rolls back its in-memory Order Book**. Instead, before opening the gate for new orders from the Order Gateways, the Active Matching Engine replays the missing delta (`seq_id` from `redis_seq_id + 1` to `wal_seq_id`) **forward** from its local WAL into the promoted Redis instance via idempotent `apply_match_result.lua` calls, advancing Redis's `seq_id` counter, `user:{id}:balance` hashes, and `stream:fills` to exactly match `wal_seq_id`. Only after `redis_seq_id == wal_seq_id` is verified does normal order intake resume—achieving **strict `RPO = 0` with zero committed-trade rollback** at $0 extra AWS infrastructure cost.
 
 ---
 

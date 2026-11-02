@@ -62,19 +62,33 @@ echo "[SSM] Active slot: ${ACTIVE_SLOT} (${ACTIVE_PORT}) -> Deploying candidate:
 aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 docker pull "${FULL_IMAGE}"
 
-# 3. Fetch runtime secrets from AWS SSM Parameter Store into a secure tmpfs (/dev/shm) file.
-#    - We bind-mount this tmpfs file read-only into the container (-v .../app.env:ro)
-#      and source it via the container entrypoint instead of passing --env-file,
-#      preventing Docker from persisting plaintext secrets onto the EBS root disk
-#      under /var/lib/docker/containers/<id>/config.v2.json.
-#    - We also install a lightweight boot-time systemd unit (Before=docker.service)
-#      so if the EC2 host reboots, /dev/shm/api-*.env is repopulated from SSM
-#      before Docker restarts the container (preventing Docker from creating an
-#      empty directory at the missing tmpfs bind-mount path).
-ENV_FILE="/dev/shm/api-${CANDIDATE_SLOT}.env"
-OLD_ENV_FILE="/dev/shm/api-${ACTIVE_SLOT}.env"
+# 3. Fetch runtime secrets from AWS SSM Parameter Store into a secure tmpfs (/dev/shm) JSON file.
+#    - Instead of passing --env-file (which causes Docker to persist plaintext secrets onto
+#      the EBS root disk in /var/lib/docker/containers/<id>/config.v2.json) or relying on
+#      `/bin/sh` + `jq @sh` (which fails on shell-less Distroless images and can break on
+#      multiline/special-character secret values across dash/ash), we serialize a strict
+#      JSON key-value map (/dev/shm/api-<slot>.secrets.json) and load it directly into
+#      Node.js `process.env` via a tiny read-only preload script (`NODE_OPTIONS="--require /run/secrets/preload.js"`).
+#    - This works identically on both Alpine/Debian and shell-less Distroless Node.js images,
+#      handles arbitrary special/multiline characters safely via `JSON.parse`, and keeps
+#      secrets strictly in RAM (`tmpfs`).
+ENV_FILE="/dev/shm/api-${CANDIDATE_SLOT}.secrets.json"
+OLD_ENV_FILE="/dev/shm/api-${ACTIVE_SLOT}.secrets.json"
+PRELOAD_JS="/dev/shm/preload-secrets.js"
 umask 077
 rm -rf "${ENV_FILE}"
+
+cat > "${PRELOAD_JS}" <<'PRELOAD_EOF'
+const fs = require("fs");
+const secretPath = "/run/secrets/app.secrets.json";
+if (fs.existsSync(secretPath)) {
+  const secrets = JSON.parse(fs.readFileSync(secretPath, "utf8"));
+  for (const [k, v] of Object.entries(secrets)) {
+    if (process.env[k] === undefined) process.env[k] = String(v);
+  }
+}
+PRELOAD_EOF
+chmod 0444 "${PRELOAD_JS}"
 
 SSM_JSON=$(aws ssm get-parameters-by-path \
   --region "${AWS_REGION}" \
@@ -89,25 +103,52 @@ if [ "${PARAM_COUNT}" -eq 0 ]; then
   exit 1
 fi
 
-echo "${SSM_JSON}" | jq -r '.Parameters[] | "\(.Name | split("/") | last)=\(.Value | @sh)"' > "${ENV_FILE}"
-# Dynamically detect the runtime UID:GID configured in the container image (e.g. 1000:1000 for node,
-# 65532:65532 for distroless/nonroot) so chmod 0400 never fails if the base image user changes.
-CONTAINER_UID=$(docker run --rm --entrypoint /usr/bin/id "${FULL_IMAGE}" -u 2>/dev/null || echo "1000")
-CONTAINER_GID=$(docker run --rm --entrypoint /usr/bin/id "${FULL_IMAGE}" -g 2>/dev/null || echo "1000")
-chmod 0400 "${ENV_FILE}"
-chown "${CONTAINER_UID}:${CONTAINER_GID}" "${ENV_FILE}" || true
+echo "${SSM_JSON}" | jq 'reduce .Parameters[] as $p ({}; .[($p.Name | split("/") | last)] = $p.Value)' > "${ENV_FILE}"
 
-# Ensure boot-time systemd unit exists to repopulate /dev/shm/api-*.env before docker.service on EC2 reboot
+# Inspect image metadata directly (without spawning `/usr/bin/id`, which does not exist in Distroless images)
+IMAGE_USER=$(docker inspect --format='{{.Config.User}}' "${FULL_IMAGE}" 2>/dev/null || echo "")
+case "${IMAGE_USER}" in
+  ""|root|0|0:0)
+    CONTAINER_UID=0; CONTAINER_GID=0 ;;
+  node|node:node)
+    CONTAINER_UID=1000; CONTAINER_GID=1000 ;;
+  nonroot|nonroot:nonroot)
+    CONTAINER_UID=65532; CONTAINER_GID=65532 ;;
+  *:*)
+    CONTAINER_UID="${IMAGE_USER%%:*}"; CONTAINER_GID="${IMAGE_USER##*:}" ;;
+  *)
+    if [[ "${IMAGE_USER}" =~ ^[0-9]+$ ]]; then
+      CONTAINER_UID="${IMAGE_USER}"; CONTAINER_GID="${IMAGE_USER}"
+    else
+      CONTAINER_UID=1000; CONTAINER_GID=1000
+    fi
+    ;;
+esac
+chmod 0400 "${ENV_FILE}"
+chown "${CONTAINER_UID}:${CONTAINER_GID}" "${ENV_FILE}" 2>/dev/null || chmod 0444 "${ENV_FILE}"
+
+# Ensure boot-time systemd unit exists to repopulate /dev/shm/api-*.secrets.json before docker.service on EC2 reboot
 cat > /usr/local/bin/hydrate-api-shm-secrets.sh <<BOOT_EOF
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+cat > "${PRELOAD_JS}" <<'INNER_EOF'
+const fs = require("fs");
+const secretPath = "/run/secrets/app.secrets.json";
+if (fs.existsSync(secretPath)) {
+  const secrets = JSON.parse(fs.readFileSync(secretPath, "utf8"));
+  for (const [k, v] of Object.entries(secrets)) {
+    if (process.env[k] === undefined) process.env[k] = String(v);
+  }
+}
+INNER_EOF
+chmod 0444 "${PRELOAD_JS}"
 for slot in blue green; do
-  rm -rf "/dev/shm/api-\${slot}.env"
+  rm -rf "/dev/shm/api-\${slot}.secrets.json"
   aws ssm get-parameters-by-path --region "${AWS_REGION}" --path "${SSM_CONFIG_PATH}" --recursive --with-decryption --output json \
-    | jq -r '.Parameters[] | "\(.Name | split("/") | last)=\(.Value | @sh)"' > "/dev/shm/api-\${slot}.env"
-  chmod 0400 "/dev/shm/api-\${slot}.env"
-  chown "${CONTAINER_UID}:${CONTAINER_GID}" "/dev/shm/api-\${slot}.env" || true
+    | jq 'reduce .Parameters[] as \$p ({}; .[(\$p.Name | split("/") | last)] = \$p.Value)' > "/dev/shm/api-\${slot}.secrets.json"
+  chmod 0400 "/dev/shm/api-\${slot}.secrets.json"
+  chown "${CONTAINER_UID}:${CONTAINER_GID}" "/dev/shm/api-\${slot}.secrets.json" 2>/dev/null || chmod 0444 "/dev/shm/api-\${slot}.secrets.json"
 done
 BOOT_EOF
 chmod 0700 /usr/local/bin/hydrate-api-shm-secrets.sh
@@ -131,16 +172,20 @@ UNIT_EOF
 systemctl daemon-reload && systemctl enable api-shm-secrets.service >/dev/null 2>&1 || true
 
 # 4. Run backward-compatible (expand-only) DB migrations ONCE per release across the fleet.
-#    Since SSM executes with --max-concurrency 1, the first EC2 instance runs migrate:up and
+#    Since SSM executes with --max-concurrency 1, the first EC2 instance runs migrate and
 #    records ${FULL_IMAGE} in SSM Parameter Store so instances 2..N skip redundant migration runs.
+#    Note: Uses `node` directly (e.g. `src/migrate.js`) if present so it works on both
+#    standard Alpine/Debian images and shell-less Distroless images (which have `node` but no `npm`).
 LAST_MIGRATED=$(aws ssm get-parameter --region "${AWS_REGION}" --name "${SSM_CONFIG_PATH}/_last_migrated_image" --query "Parameter.Value" --output text 2>/dev/null || echo "")
 if [ "${LAST_MIGRATED}" != "${FULL_IMAGE}" ]; then
   echo "[SSM] Running expand-only database migrations for ${FULL_IMAGE} (once per release)..."
   docker run --rm \
-    -v "${ENV_FILE}:/run/secrets/app.env:ro" \
-    --entrypoint /bin/sh \
+    -v "${ENV_FILE}:/run/secrets/app.secrets.json:ro" \
+    -v "${PRELOAD_JS}:/run/secrets/preload.js:ro" \
+    -e NODE_OPTIONS="--require /run/secrets/preload.js" \
+    --entrypoint node \
     "${FULL_IMAGE}" \
-    -c 'set -a && . /run/secrets/app.env && set +a && npm run migrate:up --if-present'
+    -e 'const fs=require("fs"),cp=require("child_process"); if(fs.existsSync("src/migrate.js")){require("./src/migrate.js");}else if(fs.existsSync("package.json")&& (JSON.parse(fs.readFileSync("package.json")).scripts||{})["migrate:up"]){cp.execSync("npm run migrate:up",{stdio:"inherit"});}'
   aws ssm put-parameter \
     --region "${AWS_REGION}" \
     --name "${SSM_CONFIG_PATH}/_last_migrated_image" \
@@ -151,24 +196,19 @@ else
   echo "[SSM] Database migrations already applied for ${FULL_IMAGE}; skipping on this instance."
 fi
 
-# 5. Start candidate container on the inactive port, dynamically preserving the image's
-#    native ENTRYPOINT/CMD from its Dockerfile (via exec "$@") rather than hardcoding node paths.
-mapfile -t IMAGE_ARGS < <(docker inspect --format='{{range .Config.Entrypoint}}{{println .}}{{end}}{{range .Config.Cmd}}{{println .}}{{end}}' "${FULL_IMAGE}" | sed '/^$/d')
-if [ "${#IMAGE_ARGS[@]}" -eq 0 ]; then
-  IMAGE_ARGS=("node" "src/index.js")
-fi
-
+# 5. Start candidate container on the inactive port, preserving the image's native
+#    ENTRYPOINT/CMD directly (no `/bin/sh` wrapper required, full Distroless compatibility).
 docker rm -f "api-${CANDIDATE_SLOT}" >/dev/null 2>&1 || true
 docker run -d \
   --name "api-${CANDIDATE_SLOT}" \
   --restart unless-stopped \
   --init \
-  -v "${ENV_FILE}:/run/secrets/app.env:ro" \
+  -v "${ENV_FILE}:/run/secrets/app.secrets.json:ro" \
+  -v "${PRELOAD_JS}:/run/secrets/preload.js:ro" \
+  -e NODE_OPTIONS="--require /run/secrets/preload.js" \
   -e PORT=3000 \
   -p "127.0.0.1:${CANDIDATE_PORT}:3000" \
-  --entrypoint /bin/sh \
-  "${FULL_IMAGE}" \
-  -c 'set -a && . /run/secrets/app.env && set +a && exec "$@"' -- "${IMAGE_ARGS[@]}"
+  "${FULL_IMAGE}"
 
 # 5. Poll candidate health check (/status) before switching traffic
 HEALTHY=0
@@ -242,29 +282,44 @@ printf -v ENV_HEADER "AWS_REGION=%q\nECR_REGISTRY=%q\nFULL_IMAGE=%q\nSSM_CONFIG_
   "${AWS_REGION}" "${ECR_REGISTRY}" "${FULL_IMAGE}" "${SSM_CONFIG_PATH}"
 REMOTE_SCRIPT="${ENV_HEADER}${REMOTE_BODY}"
 
-# Dispatch command via AWS SSM Run Command (1 instance at a time for rolling safety)
+# Dispatch command via AWS SSM Run Command:
+#   - Uses --max-concurrency "${SSM_MAX_CONCURRENCY:-1}" (defaults to 1 instance at a time
+#     for sequential rolling safety and fleet-once migration gating; configurable to "25%" for large fleets).
+#   - Polling loop dynamically extends up to 180 attempts * 5s = 15 minutes (matching the
+#     GitHub Actions job timeout) and adjusts dynamically once TARGET_COUNT is reported so
+#     multi-instance production fleets (e.g. 8-15 EC2 instances) never hit a premature 5-minute timeout.
+MAX_CONCURRENCY="${SSM_MAX_CONCURRENCY:-1}"
 COMMAND_ID=$(aws ssm send-command \
   --region "${AWS_REGION}" \
   --document-name "AWS-RunShellScript" \
   --targets "Key=tag:Role,Values=${TARGET_TAG_VALUE}" \
-  --max-concurrency "1" \
+  --max-concurrency "${MAX_CONCURRENCY}" \
   --max-errors "0" \
   --comment "Deploy ${FULL_IMAGE}" \
   --parameters "$(jq -n --arg script "${REMOTE_SCRIPT}" '{commands: [$script]}')" \
   --query "Command.CommandId" \
   --output text)
 
-echo "Dispatched SSM Command ID: ${COMMAND_ID}. Waiting for execution to finish..."
+echo "Dispatched SSM Command ID: ${COMMAND_ID} (max-concurrency=${MAX_CONCURRENCY}). Waiting for execution to finish..."
 
-# Poll command status until completion (and verify TargetCount > 0 to prevent silent 0-instance success)
-for attempt in $(seq 1 60); do
+MAX_ATTEMPTS="${SSM_POLL_MAX_ATTEMPTS:-180}"
+attempt=1
+while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
   read -r STATUS TARGET_COUNT COMPLETED_COUNT <<< "$(aws ssm list-commands \
     --region "${AWS_REGION}" \
     --command-id "${COMMAND_ID}" \
     --query "Commands[0].[Status,TargetCount,CompletedCount]" \
     --output text)"
 
-  echo "[Attempt ${attempt}/60] SSM Command Status: ${STATUS} (Targets: ${COMPLETED_COUNT:-0}/${TARGET_COUNT:-0})"
+  # Dynamically ensure at least 12 attempts (60s) per target instance when running sequentially
+  if [ "${TARGET_COUNT:-0}" -gt 0 ]; then
+    REQUIRED_ATTEMPTS=$(( TARGET_COUNT * 12 + 24 ))
+    if [ "${REQUIRED_ATTEMPTS}" -gt "${MAX_ATTEMPTS}" ]; then
+      MAX_ATTEMPTS="${REQUIRED_ATTEMPTS}"
+    fi
+  fi
+
+  echo "[Attempt ${attempt}/${MAX_ATTEMPTS}] SSM Command Status: ${STATUS} (Targets: ${COMPLETED_COUNT:-0}/${TARGET_COUNT:-0})"
 
   if [ "${TARGET_COUNT:-0}" -eq 0 ] && [ "${STATUS}" != "Pending" ]; then
     echo "ERROR: SSM Command ${COMMAND_ID} matched 0 EC2 instances for tag Role=${TARGET_TAG_VALUE}!"
@@ -287,6 +342,7 @@ for attempt in $(seq 1 60); do
       exit 1
       ;;
   esac
+  attempt=$(( attempt + 1 ))
   sleep 5
 done
 
