@@ -44,8 +44,8 @@ In a spot exchange like Binance, API traffic follows a known read/write distribu
 * **WebSocket Broadcast Bandwidth (Peak Burst vs. 24/7 Compressed Baseline):**
   * **Peak Volatility Burst:** `5,000` concurrent traders receiving L2 order book diffs (`~500 bytes` every `100ms` = `5 KB/s/client`):
     $$\text{Bandwidth}_{\text{WS, peak}} = 5,000 \times 5 \text{ KB/s} = 25 \text{ MB/s} = 200 \text{ Mbps}$$
-  * **24/7 Average Baseline (for Monthly AWS Egress Costing):** With `permessage-deflate` / JSON array compact framing (`~1.5 KB/s/client` average across quiet and active market hours) and `~800` time-weighted average concurrent WebSocket connections (`~1.2 MB/s` WS + `~1.4 MB/s` HTTP egress = `2.6 MB/s` total sustained egress):
-    $$\text{Monthly Internet Egress} \approx 2.6 \text{ MB/s} \times 86,400 \text{ s/day} \times 30 \text{ days} \approx \mathbf{6.7 \text{ TB/month}}$$
+  * **24/7 Average Baseline (for Monthly AWS Egress Costing):** With `permessage-deflate` / JSON array compact framing (`~1.0 KB/s/client` average across quiet and active market hours), `~500` time-weighted average concurrent WebSocket connections (`~0.5 MB/s` WS egress), and gzipped HTTP API responses (`~0.7 MB/s` HTTP egress = `1.2 MB/s` total sustained egress):
+    $$\text{Monthly Internet Egress} \approx 1.2 \text{ MB/s} \times 86,400 \text{ s/day} \times 30 \text{ days} \approx \mathbf{3.1 \text{ TB/month}}$$
 * **Hardware Limit Check:** Each ECS Fargate task and `c7g.large` instance provides **up to 10–12.5 Gbps (10,000+ Mbps)** of ENA network bandwidth. At `280 Mbps` combined peak, network utilization is **`< 2.8%`**.
 
 ---
@@ -89,7 +89,7 @@ In a spot exchange like Binance, API traffic follows a known read/write distribu
   * Price levels stored in a Red-Black Tree / B-Tree ($M \le 10,000$ distinct price ticks per pair); orders within each price level stored in a doubly-linked FIFO queue.
   * **Insert Limit Order:** $O(\log M) \approx 14$ pointer comparisons $\approx \mathbf{2 \text{ microseconds } (\mu\text{s})}$.
   * **Cancel Order (via Hash Map OrderID -> Node Pointer):** $O(1) \approx \mathbf{0.5 \text{ }\mu\text{s}}$.
-  * **Match Market/Crossing Order (avg 2 fills):** $\approx \mathbf{5 \text{ }\mu\text{s}}$ in RAM + `~45` $\mu\text{s}$ serialization/socket I/O = **$S_{\text{match}} \approx 50 \text{ }\mu\text{s} = 0.05 \text{ ms}$**.
+  * **Match Market/Crossing Order (avg 2 fills):** $\approx \mathbf{5 \text{ }\mu\text{s}}$ in RAM + `~45` $\mu\text{s}$ amortized pipelined serialization/socket I/O (draining orders via opportunistic micro-batches `XREADGROUP COUNT 64` and flushing a single pipelined `WAIT 1 50` barrier per batch so the single-threaded matching loop never blocks sequentially on per-order Cross-AZ RTT) = **$S_{\text{match}} \approx 50 \text{ }\mu\text{s} = 0.05 \text{ ms}$**.
 * **Single-Core Matching Capacity:**
   $$\mu_{\text{match}} = \frac{1 \text{ s}}{0.00005 \text{ s/order}} = \mathbf{20,000 \text{ orders/sec per trading pair}}$$
 * At `150 orders/sec` baseline (`750 orders/sec` peak), the Matching Engine core utilization is **$\rho = \frac{150}{20,000} = 0.75\%$** (**`3.75%` at peak**).
@@ -287,7 +287,7 @@ sequenceDiagram
   * **Periodic Order Book Snapshots for Resting Multi-Day GTC Orders (Cold-Boot Recovery):**
     * Because the Redis Stream keeps a rolling 24-hour buffer (`3.88 GB`), what happens to **Good-Till-Canceled (GTC) limit orders** placed days or weeks ago if both Matching Engine instances ever restart simultaneously?
     * Every **60 seconds** (and on `SIGTERM` graceful shutdown), the **Warm Standby** serializes a binary snapshot of the in-memory Order Book (tagged with `snapshot_seq_id`) to **Amazon S3** (and local EBS) without impacting the Active node's latency. On a cold boot, a new Matching Engine loads the latest S3 snapshot in `< 50ms` and replays only the delta events (`seq_id > snapshot_seq_id`) from the Redis Stream, restoring 100% of historical resting GTC orders in under 1 second.
-  * **ElastiCache Redis Multi-AZ Failover Behavior:** If the ElastiCache Primary node itself suffers a hardware failure, ElastiCache Multi-AZ automatically promotes the cross-AZ replica and updates DNS within `~10–25 seconds`. Upon promotion, the Matching Engine reconciles the highest `seq_id` present in the promoted Redis stream against its in-memory state before resuming order intake.
+  * **ElastiCache Redis Multi-AZ Failover Behavior & `WAIT` Replication Semantics:** Note that Redis `WAIT 1 50` enforces synchronous Cross-AZ memory replication acknowledgment under normal operation (pipelined once per opportunistic micro-batch), though Redis replication is not a strict Raft/Paxos consensus quorum. If the ElastiCache Primary node suffers a sudden hardware failure before flushing an in-flight batch, ElastiCache Multi-AZ automatically promotes the cross-AZ replica and updates DNS within `~10–25 seconds`. Upon promotion, the Matching Engine reconciles the highest `seq_id` present in the promoted Redis stream against its in-memory state before resuming order intake, while any un-acknowledged tail request that timed out at the Order Gateway is safely retried by the client using its deterministic idempotency key (`client_order_id`).
 
 ---
 

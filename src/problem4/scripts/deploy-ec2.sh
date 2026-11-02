@@ -95,8 +95,12 @@ if [ "${PARAM_COUNT}" -eq 0 ]; then
 fi
 
 echo "${SSM_JSON}" | jq -r '.Parameters[] | "\(.Name | split("/") | last)=\(.Value | @sh)"' > "${ENV_FILE}"
+# Dynamically detect the runtime UID:GID configured in the container image (e.g. 1000:1000 for node,
+# 65532:65532 for distroless/nonroot) so chmod 0400 never fails if the base image user changes.
+CONTAINER_UID=$(docker run --rm --entrypoint /usr/bin/id "${FULL_IMAGE}" -u 2>/dev/null || echo "1000")
+CONTAINER_GID=$(docker run --rm --entrypoint /usr/bin/id "${FULL_IMAGE}" -g 2>/dev/null || echo "1000")
 chmod 0400 "${ENV_FILE}"
-chown 1000:1000 "${ENV_FILE}" || true
+chown "${CONTAINER_UID}:${CONTAINER_GID}" "${ENV_FILE}" || true
 
 # Ensure boot-time systemd unit exists to repopulate /dev/shm/api-*.env before docker.service on EC2 reboot
 cat > /usr/local/bin/hydrate-api-shm-secrets.sh <<BOOT_EOF
@@ -108,7 +112,7 @@ for slot in blue green; do
   aws ssm get-parameters-by-path --region "${AWS_REGION}" --path "${SSM_CONFIG_PATH}" --recursive --with-decryption --output json \
     | jq -r '.Parameters[] | "\(.Name | split("/") | last)=\(.Value | @sh)"' > "/dev/shm/api-\${slot}.env"
   chmod 0400 "/dev/shm/api-\${slot}.env"
-  chown 1000:1000 "/dev/shm/api-\${slot}.env" || true
+  chown "${CONTAINER_UID}:${CONTAINER_GID}" "/dev/shm/api-\${slot}.env" || true
 done
 BOOT_EOF
 chmod 0700 /usr/local/bin/hydrate-api-shm-secrets.sh

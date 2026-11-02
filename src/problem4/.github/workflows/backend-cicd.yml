@@ -131,11 +131,12 @@ jobs:
 
       - name: Compute immutable image tags
         id: meta
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           IMAGE_TAG="sha-${SHORT_SHA}"
-          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          IMAGE_URI="${REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
@@ -152,7 +153,6 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             BUILD_SHA=${{ github.sha }}
-            BUILD_TIME=${{ github.event.head_commit.timestamp }}
 
       - name: Scan container image with Trivy
         uses: aquasecurity/trivy-action@0.28.0
@@ -166,8 +166,9 @@ jobs:
 
       - name: Push verified local image to Amazon ECR (bit-for-bit identical to scanned image)
         id: build
+        env:
+          IMAGE_URI: ${{ steps.meta.outputs.image_uri }}
         run: |
-          IMAGE_URI="${{ steps.meta.outputs.image_uri }}"
           docker push "${IMAGE_URI}"
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_URI}" | cut -d'@' -f2)
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
@@ -211,13 +212,20 @@ jobs:
           role-to-assume: ${{ secrets.AWS_OIDC_STAGING_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Resolve target image tag
+      - name: Resolve and validate target image tag
         id: target
+        env:
+          ROLLBACK_TAG: ${{ inputs.rollback_image_tag }}
+          BUILT_TAG: ${{ needs.build-and-publish.outputs.image_tag }}
         run: |
-          if [ -n "${{ inputs.rollback_image_tag }}" ]; then
-            echo "tag=${{ inputs.rollback_image_tag }}" >> "$GITHUB_OUTPUT"
+          if [ -n "${ROLLBACK_TAG}" ]; then
+            if [[ ! "${ROLLBACK_TAG}" =~ ^sha-[a-fA-F0-9]{7,40}$ ]]; then
+              echo "ERROR: Invalid rollback_image_tag format '${ROLLBACK_TAG}'. Expected sha-<hex>."
+              exit 1
+            fi
+            echo "tag=${ROLLBACK_TAG}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ needs.build-and-publish.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${BUILT_TAG}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Trigger zero-downtime EC2 deployment via AWS SSM Run Command
@@ -279,13 +287,20 @@ jobs:
           role-to-assume: ${{ secrets.AWS_OIDC_PROD_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Resolve target image tag
+      - name: Resolve and validate target image tag
         id: target
+        env:
+          ROLLBACK_TAG: ${{ inputs.rollback_image_tag }}
+          BUILT_TAG: ${{ needs.build-and-publish.outputs.image_tag }}
         run: |
-          if [ -n "${{ inputs.rollback_image_tag }}" ]; then
-            echo "tag=${{ inputs.rollback_image_tag }}" >> "$GITHUB_OUTPUT"
+          if [ -n "${ROLLBACK_TAG}" ]; then
+            if [[ ! "${ROLLBACK_TAG}" =~ ^sha-[a-fA-F0-9]{7,40}$ ]]; then
+              echo "ERROR: Invalid rollback_image_tag format '${ROLLBACK_TAG}'. Expected sha-<hex>."
+              exit 1
+            fi
+            echo "tag=${ROLLBACK_TAG}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ needs.build-and-publish.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${BUILT_TAG}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Trigger zero-downtime EC2 deployment via AWS SSM Run Command

@@ -25,12 +25,17 @@ DIST_DIR="${DIST_DIR:-./dist}"
 ARCHIVE_BUCKET="${S3_BUCKET}-releases"
 
 if [ -n "${ROLLBACK_SHA}" ]; then
-  echo "Rolling back S3 bucket s3://${S3_BUCKET} to archived release ${ROLLBACK_SHA}..."
-  mkdir -p "${DIST_DIR}"
-  aws s3 sync "s3://${ARCHIVE_BUCKET}/${ROLLBACK_SHA}/" "${DIST_DIR}/" --exact-timestamps --only-show-errors
+  if [[ ! "${ROLLBACK_SHA}" =~ ^[a-fA-F0-9]{7,40}$ ]]; then
+    echo "ERROR: Invalid ROLLBACK_SHA '${ROLLBACK_SHA}'. Expected 7-40 hex characters."
+    exit 1
+  fi
   ACTIVE_SHA="${ROLLBACK_SHA}"
+  SOURCE_URI="s3://${ARCHIVE_BUCKET}/${ACTIVE_SHA}"
+  echo "Rolling back S3 bucket s3://${S3_BUCKET} directly from S3 archive ${SOURCE_URI}/ (S3-to-S3 copy)..."
+  mkdir -p "${DIST_DIR}"
 else
   ACTIVE_SHA="${RELEASE_SHA}"
+  SOURCE_URI="${DIST_DIR}"
   echo "Archiving immutable release ${ACTIVE_SHA} to s3://${ARCHIVE_BUCKET}/${ACTIVE_SHA}/..."
   aws s3 sync "${DIST_DIR}/" "s3://${ARCHIVE_BUCKET}/${ACTIVE_SHA}/" --only-show-errors
 fi
@@ -45,14 +50,14 @@ cat > "${DIST_DIR}/config.json" <<EOF
 EOF
 
 echo "Phase 1a: Uploading fingerprinted assets (assets/*) with 1-year immutable caching..."
-if [ -d "${DIST_DIR}/assets" ]; then
-  aws s3 sync "${DIST_DIR}/assets/" "s3://${S3_BUCKET}/assets/" \
+if [ -n "${ROLLBACK_SHA}" ] || [ -d "${DIST_DIR}/assets" ]; then
+  aws s3 sync "${SOURCE_URI}/assets/" "s3://${S3_BUCKET}/assets/" \
     --cache-control "public, max-age=31536000, immutable" \
     --only-show-errors
 fi
 
 echo "Phase 1b: Uploading non-fingerprinted root static files (favicon, manifest, robots.txt) with short TTL..."
-aws s3 sync "${DIST_DIR}/" "s3://${S3_BUCKET}/" \
+aws s3 sync "${SOURCE_URI}/" "s3://${S3_BUCKET}/" \
   --exclude "assets/*" \
   --exclude "index.html" \
   --exclude "config.json" \
@@ -61,12 +66,19 @@ aws s3 sync "${DIST_DIR}/" "s3://${S3_BUCKET}/" \
   --only-show-errors
 
 echo "Phase 2: Uploading entrypoints (index.html, config.json) with no-cache headers..."
-for entry in index.html config.json service-worker.js; do
-  if [ -f "${DIST_DIR}/${entry}" ]; then
-    CONTENT_TYPE="text/html; charset=utf-8"
-    [[ "${entry}" == *.json ]] && CONTENT_TYPE="application/json; charset=utf-8"
-    [[ "${entry}" == *.js ]] && CONTENT_TYPE="application/javascript; charset=utf-8"
+aws s3 cp "${DIST_DIR}/config.json" "s3://${S3_BUCKET}/config.json" \
+  --cache-control "no-cache, no-store, must-revalidate" \
+  --content-type "application/json; charset=utf-8"
 
+for entry in index.html service-worker.js; do
+  CONTENT_TYPE="text/html; charset=utf-8"
+  [[ "${entry}" == *.js ]] && CONTENT_TYPE="application/javascript; charset=utf-8"
+
+  if [ -n "${ROLLBACK_SHA}" ]; then
+    aws s3 cp "${SOURCE_URI}/${entry}" "s3://${S3_BUCKET}/${entry}" \
+      --cache-control "no-cache, no-store, must-revalidate" \
+      --content-type "${CONTENT_TYPE}" 2>/dev/null || true
+  elif [ -f "${DIST_DIR}/${entry}" ]; then
     aws s3 cp "${DIST_DIR}/${entry}" "s3://${S3_BUCKET}/${entry}" \
       --cache-control "no-cache, no-store, must-revalidate" \
       --content-type "${CONTENT_TYPE}"
@@ -85,23 +97,25 @@ aws cloudfront wait invalidation-completed \
   --distribution-id "${CF_DISTRIBUTION_ID}" \
   --id "${INVALIDATION_ID}"
 
-echo "Phase 4: Pruning obsolete hashed assets older than 7 days that are not in the active release..."
-# Why not use a blind 30-day S3 Lifecycle Expiration on the live bucket?
-# Because unchanged hashed chunks (e.g. vendor.js or fonts) keep their original CreationDate
-# across builds and would be deleted by S3 Lifecycle while still referenced by index.html!
-# Instead, we only prune s3://${S3_BUCKET}/assets/* objects that are BOTH absent from the
-# current ${DIST_DIR}/assets/ bundle AND older than 7 days (preserving active + recent chunks).
-CUTOFF_ISO=$(date -u -v-7d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "7 days ago" +"%Y-%m-%dT%H:%M:%SZ")
-aws s3api list-objects-v2 \
-  --bucket "${S3_BUCKET}" \
-  --prefix "assets/" \
-  --query "Contents[?LastModified<='${CUTOFF_ISO}'].Key" \
-  --output text | tr '\t' '\n' | while read -r key; do
-    if [ -n "${key}" ] && [ "${key}" != "None" ] && [ ! -f "${DIST_DIR}/${key}" ]; then
-      echo "Pruning obsolete asset s3://${S3_BUCKET}/${key}..."
-      aws s3 rm "s3://${S3_BUCKET}/${key}" --only-show-errors
-    fi
-  done
+if [ -z "${ROLLBACK_SHA}" ]; then
+  echo "Phase 4: Pruning obsolete hashed assets older than 7 days that are not in the active release..."
+  # Why not use a blind 30-day S3 Lifecycle Expiration on the live bucket?
+  # Because unchanged hashed chunks (e.g. vendor.js or fonts) keep their original CreationDate
+  # across builds and would be deleted by S3 Lifecycle while still referenced by index.html!
+  # Instead, we only prune s3://${S3_BUCKET}/assets/* objects that are BOTH absent from the
+  # current ${DIST_DIR}/assets/ bundle AND older than 7 days (preserving active + recent chunks).
+  CUTOFF_ISO=$(date -u -v-7d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "7 days ago" +"%Y-%m-%dT%H:%M:%SZ")
+  aws s3api list-objects-v2 \
+    --bucket "${S3_BUCKET}" \
+    --prefix "assets/" \
+    --query "Contents[?LastModified<='${CUTOFF_ISO}'].Key" \
+    --output text | tr '\t' '\n' | while read -r key; do
+      if [ -n "${key}" ] && [ "${key}" != "None" ] && [ ! -f "${DIST_DIR}/${key}" ]; then
+        echo "Pruning obsolete asset s3://${S3_BUCKET}/${key}..."
+        aws s3 rm "s3://${S3_BUCKET}/${key}" --only-show-errors
+      fi
+    done
+fi
 
 echo "Frontend SPA release ${ACTIVE_SHA} is live!"
 

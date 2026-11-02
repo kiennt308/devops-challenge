@@ -254,12 +254,16 @@ sudo mkdir -p /etc/systemd/journald.conf.d
 printf "[Journal]\nSystemMaxUse=500M\nMaxRetentionSec=7day\n" | sudo tee /etc/systemd/journald.conf.d/size-limit.conf
 sudo systemctl restart systemd-journald
 
-# 2. Clear crash dumps and APT package cache
+# 2. Clear crash dumps and APT package cache first
 sudo rm -rf /var/crash/* /var/lib/apport/coredump/*
 sudo apt-get clean
+
+# 3. Verify that / and /boot have at least >500MB free before running autoremove
+#    (purging old Linux kernels triggers update-initramfs, which fails if /boot or /var/tmp is full)
+df -h / /boot
 sudo apt-get autoremove --purge -y
 
-# 3. Verify free space recovered
+# 4. Verify total free space recovered
 df -h /
 ```
 

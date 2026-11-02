@@ -66,8 +66,8 @@ flowchart LR
         %% 5. AIR-GAPPED CORE TIER
         subgraph IsolatedSubnet ["Zone C: Air-Gapped Isolated Subnets (No IGW / No NAT GW)"]
             Redis["ElastiCache Redis 7\n[CHANGED] TLS In-Transit + KMS At-Rest,\nRedis ACLs (EVALSHA Only for GW)"]
-            MatchActive["Matching Engine (Active c7g.large)\n[CHANGED] IMDSv2 Hop=1, Nitro Enclave\nVerifies Client Ed25519 + Signs Fills"]
-            MatchStandby["Matching Engine (Warm Standby)\n[CHANGED] Identical PCR0 Enclave\n+ Canonical Hash Chain Replay"]
+            MatchActive["Matching Engine (Active c7g.xlarge)\n[CHANGED] Upgraded to 4 vCPUs for Nitro Enclave,\nIMDSv2 Hop=1, Verifies Client Ed25519 + Signs Fills"]
+            MatchStandby["Matching Engine (Warm Standby c7g.xlarge)\n[CHANGED] Identical PCR0 Enclave\n+ Canonical Hash Chain Replay"]
             DynamoLease[("DynamoDB Leader Lease\n[ADDED] Strongly-Consistent\nConditional Epoch Fencing")]
             AuroraW[("Aurora Postgres Writer\n[CHANGED] IAM DB Auth, KMS,\nPer-Asset Statement Trigger")]
             AuroraR[("Aurora Read Replica\n[CHANGED] pgaudit Enabled")]
@@ -116,7 +116,7 @@ flowchart LR
 In **Problem 1**, all backend services were depicted inside a single logical VPC block. In **Problem 5**, we re-architect the VPC into **three strictly segregated subnet tiers**:
 1. **Zone A — Public Ingress Subnets (`10.0.0.0/22`):** Contains **only** the ALB and NLB. Zero EC2/ECS compute tasks live here.
 2. **Zone B — Private Application Subnets (`10.0.4.0/22`):** Hosts the stateless **Order Gateway**, **WebSocket Gateway**, and **Settlement Workers**. Has **no Internet Gateway route**; external AWS API calls traverse **AWS PrivateLink Interface VPC Endpoints** inside the VPC.
-3. **Zone C — Air-Gapped Isolated Subnets (`10.0.8.0/22`):** Hosts **ElastiCache Redis**, **Matching Engine EC2 (`c7g.large`)**, and **Aurora PostgreSQL**.
+3. **Zone C — Air-Gapped Isolated Subnets (`10.0.8.0/22`):** Hosts **ElastiCache Redis**, **Matching Engine EC2 (`c7g.xlarge` — upgraded from `c7g.large` to 4 vCPUs / 8 GB RAM because AWS Nitro Enclaves require at least 4 vCPUs on the parent instance so 2 dedicated cores can be carved out for the Enclave while leaving 2 vCPUs for the parent host)**, and **Aurora PostgreSQL**.
    * **Routing & Anti-Exfiltration VPC Endpoint Policies:** `Zone C` has **zero route to `0.0.0.0/0` (no NAT Gateway, no IGW)**. It communicates only within `10.0.0.0/16` (including Interface VPC Endpoints for `kms` and `ssm`) and Gateway VPC Endpoints (`s3`, `dynamodb`) for 60s Order Book snapshots and DynamoDB `leader_epoch` leases.
    * **Closing the VPC Endpoint Exfiltration Loophole:** By default, an unrestricted S3 or DynamoDB VPC Endpoint allows traffic to *any* S3 bucket in AWS (allowing an attacker with RCE to run `aws s3 cp` to their own external S3 bucket). We attach a strict **VPC Endpoint Policy** enforcing `aws:ResourceAccount` / `aws:PrincipalOrgID` and allowlisting **only** the exact ARNs of the production snapshot/WORM buckets and `exchange_leader_lease` table—making external data exfiltration via VPC Endpoints impossible.
 
@@ -130,7 +130,7 @@ The most catastrophic risk in an exchange is an insider threat or a compromised 
      * `ws_gw_user`: Strictly **read-only** (`SUBSCRIBE` / `ZRANGE` on public order book keys); zero access to `user:*` balance hashes.
 2. **`[ADDED]` End-to-End `Ed25519` Verification, Canonical Hash-Chaining & KMS PCR0 Attestation:**
    * **Why a Compromised Order Gateway Cannot Forge Orders:** Because users sign orders with asymmetric **`Ed25519` private keys** and the exchange only stores their public keys, even if an attacker compromises an **Order Gateway** container and steals its internal `gw_hmac` key, they **cannot forge a valid `client_ed25519_sig`** for any user.
-   * **Canonical Deterministic Hash Chain Across Failover:** When the **Matching Engine (`c7g.large`)** inside its **AWS Nitro Enclave** verifies `client_ed25519_sig` and produces an `OrderFilled` event, it computes a deterministic state hash:
+   * **Canonical Deterministic Hash Chain Across Failover:** When the **Matching Engine (`c7g.xlarge` — upgraded from Problem 1's `c7g.large` to meet AWS Nitro Enclaves' 4-vCPU minimum hardware requirement, adding ~$105/month across Active + Warm Standby)** inside its **AWS Nitro Enclave** verifies `client_ed25519_sig` and produces an `OrderFilled` event, it computes a deterministic state hash:
      $$\text{fill\_hash}_{n} = \text{SHA256}(\text{fill\_hash}_{n-1} \parallel \text{seq\_id}_{n} \parallel \text{canonical\_fill\_payload}_{n})$$
      Crucially, `fill_hash` depends **only** on the deterministic order sequence and canonical fill data (excluding `leader_epoch` or wall-clock timestamps from the inner hash), and the Enclave then signs `(leader_epoch, seq_id, fill_hash)` using its attested private key. Because both Active and Warm-Standby replay the exact same `seq_id` stream, the Warm Standby's in-memory `fill_hash` is 100% identical to the Active node's at every `seq_id`, guaranteeing zero hash-chain forks when failing over to `leader_epoch + 1`.
    * **Cross-Account KMS Key Governance & M-of-N PCR0 Quorum:** Both Active and Warm-Standby Enclaves are built from the same reproducible Enclave Image File (`.eif`). The Master KMS Key lives in the **Dedicated Security Account** and restricts `kms:Decrypt` via `kms:RecipientAttestation:ImageSha384 == <PCR0_HASH>`. An **AWS Organizations Service Control Policy (SCP)** blocks `kms:PutKeyPolicy` and `kms:ScheduleKeyDeletion` unless approved by an **M-of-N multi-party quorum**, preventing a compromised CI/CD role or rogue admin from substituting a backdoored `<PCR0_HASH>`.
@@ -158,7 +158,7 @@ Did our security changes break Problem 1's `< 100ms` latency requirement? Let us
 | **1. AWS WAFv2 Inspection at CloudFront Edge** | **`+0.80 ms`** | Evaluated in memory at the CloudFront PoP during TLS termination. |
 | **2. Request Signature (`Ed25519`/`HMAC`) + Nonce Replay Check** | **`+0.35 ms`** | Computed on Graviton3 hardware crypto instructions; nonce check Piggybacks on the existing Redis Lua `EVALSHA` call (`0` extra network RTTs!). |
 | **3. In-Transit TLS 1.3 (`OrderGW <-> Redis <-> Matching Engine`)** | **`+0.40 ms`** | Uses persistent connection pooling (`keepalive`); TLS handshake occurs once at container boot, leaving only `AES-GCM` hardware-accelerated symmetric framing (`< 0.1ms` per hop). |
-| **4. Nitro Enclave Fill Signing (`vsock` local IPC)** | **`+0.30 ms`** | Communicates over local in-memory `AF_VSOCK` on the same `c7g.large` instance without network traversal. |
+| **4. Nitro Enclave Fill Signing (`vsock` local IPC)** | **`+0.30 ms`** | Communicates over local in-memory `AF_VSOCK` between the 2 parent vCPUs and 2 dedicated Enclave vCPUs on the same `c7g.xlarge` instance without network traversal. |
 | **Hardened End-to-End `p99` Total** | **`21.86 ms` (at 500 RPS)**<br>**`28.40 ms` (at 2,500 RPS)** | **Only `+1.85 ms` total security overhead — still `> 71 ms` faster than the `100ms` p99 ceiling!** |
 
 ---
