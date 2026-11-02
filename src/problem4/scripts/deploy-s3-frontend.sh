@@ -29,9 +29,29 @@ if [ -n "${ROLLBACK_SHA}" ]; then
     echo "ERROR: Invalid ROLLBACK_SHA '${ROLLBACK_SHA}'. Expected 7-40 hex characters."
     exit 1
   fi
-  ACTIVE_SHA="${ROLLBACK_SHA}"
+  # Resolve prefix (supports both 7-char short SHA and 40-char full SHA) against the S3 release archive
+  # and verify that index.html actually exists before touching the live bucket.
+  MATCHED_PREFIX=$(aws s3api list-objects-v2 \
+    --bucket "${ARCHIVE_BUCKET}" \
+    --prefix "${ROLLBACK_SHA}" \
+    --delimiter "/" \
+    --query "CommonPrefixes[0].Prefix" \
+    --output text 2>/dev/null || echo "None")
+
+  if [ -z "${MATCHED_PREFIX}" ] || [ "${MATCHED_PREFIX}" = "None" ]; then
+    echo "ERROR: No archived release matching '${ROLLBACK_SHA}' found in s3://${ARCHIVE_BUCKET}/! Aborting rollback."
+    exit 1
+  fi
+
+  ACTIVE_SHA="${MATCHED_PREFIX%/}"
   SOURCE_URI="s3://${ARCHIVE_BUCKET}/${ACTIVE_SHA}"
-  echo "Rolling back S3 bucket s3://${S3_BUCKET} directly from S3 archive ${SOURCE_URI}/ (S3-to-S3 copy)..."
+
+  if ! aws s3api head-object --bucket "${ARCHIVE_BUCKET}" --key "${ACTIVE_SHA}/index.html" >/dev/null 2>&1; then
+    echo "ERROR: Archive ${SOURCE_URI}/index.html is missing or incomplete! Aborting rollback."
+    exit 1
+  fi
+
+  echo "Rolling back S3 bucket s3://${S3_BUCKET} directly from verified S3 archive ${SOURCE_URI}/ (S3-to-S3 copy)..."
   mkdir -p "${DIST_DIR}"
 else
   ACTIVE_SHA="${RELEASE_SHA}"
@@ -57,7 +77,11 @@ if [ -n "${ROLLBACK_SHA}" ] || [ -d "${DIST_DIR}/assets" ]; then
 fi
 
 echo "Phase 1b: Uploading non-fingerprinted root static files (favicon, manifest, robots.txt) with short TTL..."
+# On rollback (or standard sync of root-level non-hashed files), include --delete
+# with exclusions for assets/* and entrypoints so any stale root-level file introduced
+# by a bad release is cleanly removed without touching fingerprinted assets/*.
 aws s3 sync "${SOURCE_URI}/" "s3://${S3_BUCKET}/" \
+  --delete \
   --exclude "assets/*" \
   --exclude "index.html" \
   --exclude "config.json" \
@@ -103,18 +127,33 @@ if [ -z "${ROLLBACK_SHA}" ]; then
   # Because unchanged hashed chunks (e.g. vendor.js or fonts) keep their original CreationDate
   # across builds and would be deleted by S3 Lifecycle while still referenced by index.html!
   # Instead, we only prune s3://${S3_BUCKET}/assets/* objects that are BOTH absent from the
-  # current ${DIST_DIR}/assets/ bundle AND older than 7 days (preserving active + recent chunks).
+  # current ${DIST_DIR}/assets/ bundle AND older than 7 days, using batch delete-objects
+  # (up to 1,000 keys per API call) instead of slow per-file `aws s3 rm` loops.
   CUTOFF_ISO=$(date -u -v-7d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "7 days ago" +"%Y-%m-%dT%H:%M:%SZ")
-  aws s3api list-objects-v2 \
+  STALE_KEYS_JSON=$(aws s3api list-objects-v2 \
     --bucket "${S3_BUCKET}" \
     --prefix "assets/" \
     --query "Contents[?LastModified<='${CUTOFF_ISO}'].Key" \
-    --output text | tr '\t' '\n' | while read -r key; do
-      if [ -n "${key}" ] && [ "${key}" != "None" ] && [ ! -f "${DIST_DIR}/${key}" ]; then
-        echo "Pruning obsolete asset s3://${S3_BUCKET}/${key}..."
-        aws s3 rm "s3://${S3_BUCKET}/${key}" --only-show-errors
-      fi
+    --output json)
+
+  # Filter against local DIST_DIR manifest and execute batch delete in chunks of 500
+  # (AWS s3api delete-objects accepts up to 1,000 objects per API call)
+  STALE_ARRAY=()
+  while IFS= read -r key; do
+    if [ -n "${key}" ] && [ ! -f "${DIST_DIR}/${key}" ]; then
+      STALE_ARRAY+=("${key}")
+    fi
+  done < <(echo "${STALE_KEYS_JSON}" | jq -r '.[]? // empty')
+
+  TOTAL_STALE="${#STALE_ARRAY[@]}"
+  if [ "${TOTAL_STALE}" -gt 0 ]; then
+    echo "Batch-pruning ${TOTAL_STALE} obsolete asset(s) from s3://${S3_BUCKET}/assets/..."
+    for (( offset=0; offset<TOTAL_STALE; offset+=500 )); do
+      CHUNK=("${STALE_ARRAY[@]:offset:500}")
+      printf '%s\n' "${CHUNK[@]}" | jq -R '{Key: .}' | jq -s -c '{Objects: ., Quiet: true}' | \
+        aws s3api delete-objects --bucket "${S3_BUCKET}" --delete file:///dev/stdin >/dev/null
     done
+  fi
 fi
 
 echo "Frontend SPA release ${ACTIVE_SHA} is live!"

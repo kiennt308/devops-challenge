@@ -28,13 +28,8 @@ set -euo pipefail
 FULL_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 echo "Starting SSM zero-downtime rollout of ${FULL_IMAGE} to EC2 instances tagged Role=${TARGET_TAG_VALUE}..."
 
-read -r -d '' REMOTE_SCRIPT << 'EOF' || true
+read -r -d '' REMOTE_BODY << 'EOF' || true
 set -euo pipefail
-
-AWS_REGION="__AWS_REGION__"
-ECR_REGISTRY="__ECR_REGISTRY__"
-FULL_IMAGE="__FULL_IMAGE__"
-SSM_CONFIG_PATH="__SSM_CONFIG_PATH__"
 
 # 1. Determine active vs candidate slot using NGINX upstream config as the
 #    primary source of truth (avoids killing the live slot if both containers
@@ -135,14 +130,34 @@ WantedBy=multi-user.target
 UNIT_EOF
 systemctl daemon-reload && systemctl enable api-shm-secrets.service >/dev/null 2>&1 || true
 
-# 4. Run backward-compatible (expand-only) DB migrations if present before starting candidate
-docker run --rm \
-  -v "${ENV_FILE}:/run/secrets/app.env:ro" \
-  --entrypoint /bin/sh \
-  "${FULL_IMAGE}" \
-  -c 'set -a && . /run/secrets/app.env && set +a && npm run migrate:up --if-present'
+# 4. Run backward-compatible (expand-only) DB migrations ONCE per release across the fleet.
+#    Since SSM executes with --max-concurrency 1, the first EC2 instance runs migrate:up and
+#    records ${FULL_IMAGE} in SSM Parameter Store so instances 2..N skip redundant migration runs.
+LAST_MIGRATED=$(aws ssm get-parameter --region "${AWS_REGION}" --name "${SSM_CONFIG_PATH}/_last_migrated_image" --query "Parameter.Value" --output text 2>/dev/null || echo "")
+if [ "${LAST_MIGRATED}" != "${FULL_IMAGE}" ]; then
+  echo "[SSM] Running expand-only database migrations for ${FULL_IMAGE} (once per release)..."
+  docker run --rm \
+    -v "${ENV_FILE}:/run/secrets/app.env:ro" \
+    --entrypoint /bin/sh \
+    "${FULL_IMAGE}" \
+    -c 'set -a && . /run/secrets/app.env && set +a && npm run migrate:up --if-present'
+  aws ssm put-parameter \
+    --region "${AWS_REGION}" \
+    --name "${SSM_CONFIG_PATH}/_last_migrated_image" \
+    --value "${FULL_IMAGE}" \
+    --type "String" \
+    --overwrite >/dev/null 2>&1 || true
+else
+  echo "[SSM] Database migrations already applied for ${FULL_IMAGE}; skipping on this instance."
+fi
 
-# 5. Start candidate container on the inactive port (sourcing secrets from in-memory tmpfs mount into process.env)
+# 5. Start candidate container on the inactive port, dynamically preserving the image's
+#    native ENTRYPOINT/CMD from its Dockerfile (via exec "$@") rather than hardcoding node paths.
+mapfile -t IMAGE_ARGS < <(docker inspect --format='{{range .Config.Entrypoint}}{{println .}}{{end}}{{range .Config.Cmd}}{{println .}}{{end}}' "${FULL_IMAGE}" | sed '/^$/d')
+if [ "${#IMAGE_ARGS[@]}" -eq 0 ]; then
+  IMAGE_ARGS=("node" "src/index.js")
+fi
+
 docker rm -f "api-${CANDIDATE_SLOT}" >/dev/null 2>&1 || true
 docker run -d \
   --name "api-${CANDIDATE_SLOT}" \
@@ -153,7 +168,7 @@ docker run -d \
   -p "127.0.0.1:${CANDIDATE_PORT}:3000" \
   --entrypoint /bin/sh \
   "${FULL_IMAGE}" \
-  -c 'set -a && . /run/secrets/app.env && set +a && exec node src/index.js'
+  -c 'set -a && . /run/secrets/app.env && set +a && exec "$@"' -- "${IMAGE_ARGS[@]}"
 
 # 5. Poll candidate health check (/status) before switching traffic
 HEALTHY=0
@@ -174,13 +189,37 @@ if [ "${HEALTHY}" -ne 1 ]; then
   exit 1
 fi
 
-# 6. Atomically switch local NGINX upstream to candidate port and reload
+# 6. Atomically switch local NGINX upstream to candidate port, ensure reverse-proxy
+#    server block exists (for Day-0 newly provisioned EC2 instances), and reload
 cat > /etc/nginx/conf.d/api-upstream.conf <<NGINX_EOF
 upstream api_backend {
     server 127.0.0.1:${CANDIDATE_PORT};
     keepalive 32;
 }
 NGINX_EOF
+
+if [ ! -f /etc/nginx/conf.d/api-server.conf ]; then
+  rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+  cat > /etc/nginx/conf.d/api-server.conf <<'SERVER_EOF'
+server {
+    listen 80 default_server;
+    server_name _;
+
+    location / {
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+}
+SERVER_EOF
+fi
 
 nginx -t && systemctl reload nginx
 echo "[SSM] Traffic cut over to api-${CANDIDATE_SLOT} on port ${CANDIDATE_PORT}."
@@ -197,11 +236,11 @@ docker image prune -f >/dev/null 2>&1 || true
 echo "[SSM] Deployment of ${FULL_IMAGE} completed successfully."
 EOF
 
-# Substitute runtime variables into the remote payload
-REMOTE_SCRIPT="${REMOTE_SCRIPT//__AWS_REGION__/${AWS_REGION}}"
-REMOTE_SCRIPT="${REMOTE_SCRIPT//__ECR_REGISTRY__/${ECR_REGISTRY}}"
-REMOTE_SCRIPT="${REMOTE_SCRIPT//__FULL_IMAGE__/${FULL_IMAGE}}"
-REMOTE_SCRIPT="${REMOTE_SCRIPT//__SSM_CONFIG_PATH__/${SSM_CONFIG_PATH}}"
+# Safely quote runtime variables with printf '%q' instead of string replacement
+# so special characters (&, \, quotes) never break shell syntax on the target host
+printf -v ENV_HEADER "AWS_REGION=%q\nECR_REGISTRY=%q\nFULL_IMAGE=%q\nSSM_CONFIG_PATH=%q\n" \
+  "${AWS_REGION}" "${ECR_REGISTRY}" "${FULL_IMAGE}" "${SSM_CONFIG_PATH}"
+REMOTE_SCRIPT="${ENV_HEADER}${REMOTE_BODY}"
 
 # Dispatch command via AWS SSM Run Command (1 instance at a time for rolling safety)
 COMMAND_ID=$(aws ssm send-command \

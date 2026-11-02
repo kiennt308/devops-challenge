@@ -140,13 +140,14 @@ While the prompt notes *"Provide steps to troubleshoot two production issues"* a
        postrotate
            if [ -f /run/nginx.pid ]; then
                kill -USR1 $(cat /run/nginx.pid)
+               sleep 1
            fi
        endscript
    }
    ```
-   > **Why `daily` + `maxsize 500M` + Hourly Timer (Instead of `hourly` + `rotate 14`):**
-   > * If you set `hourly` + `rotate 14`, `logrotate` unconditionally rotates every hour even when logs are tiny, deleting all logs older than **14 hours**!
-   > * By setting `daily` + `maxsize 500M` and overriding `logrotate.timer` to run **hourly**, `logrotate` only rotates mid-day if a log file actually exceeds `500M`, while preserving up to 14 days of history during normal traffic.
+   > **Why `daily` + `maxsize 500M` + Hourly Timer + `sleep 1` with `nodelaycompress`:**
+   > * If you set `hourly` + `rotate 14`, `logrotate` unconditionally rotates every hour even when logs are tiny, deleting all logs older than **14 hours**! By setting `daily` + `maxsize 500M` and overriding `logrotate.timer` to run **hourly**, `logrotate` only rotates mid-day if a log file actually exceeds `500M`, while preserving up to 14 days of history during normal traffic.
+   > * **Why `sleep 1` is critical when using `nodelaycompress`:** In Linux, `kill -USR1` is **asynchronous**—when `kill` returns, the NGINX master process has only received the signal and forwarded it to worker processes, which take a few milliseconds to reopen new file descriptors and close `.log.1`. Adding `sleep 1` inside `postrotate` guarantees all workers have flushed and closed `.log.1` before `logrotate` invokes `gzip`, preventing both log-line loss and leaving a multi-GB uncompressed `.log.1` file sitting on disk (which happens with `delaycompress`).
    > * Also note why **Step 1 (`truncate -s 0`) MUST be executed before `logrotate -f`** when disk is at 99%: running `gzip` on a 20 GB log file or writing `/var/lib/logrotate/status.tmp` when `< 700 MB` is free will fail with `No space left on device`.
 
    ```bash

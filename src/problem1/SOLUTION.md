@@ -32,7 +32,7 @@ In a spot exchange like Binance, API traffic follows a known read/write distribu
 
 | Endpoint Category | Share | Baseline ($\lambda_{\text{base}}$) | Peak Burst ($\lambda_{\text{peak}}$) | Operations Triggered Per Request |
 | :--- | :--- | :--- | :--- | :--- |
-| **Write: Place / Cancel Order** (`POST/DELETE /api/v1/order`) | `30%` | `150 RPS` | `750 RPS` | `1` HMAC/Ed25519 verify + `1` Atomic Lua (`reserve_and_enqueue.lua`: lock balance + `XADD`) + `1` In-Memory Match + `1` Atomic Lua (`apply_match_result.lua`: settle/refund + `XADD` fill + `PUBLISH` reply) + `3` Ledger DB rows (async) |
+| **Write: Place / Cancel Order** (`POST/DELETE /api/v1/order`) | `30%` | `150 RPS` | `750 RPS` | `1` HMAC/Ed25519 verify + `1` Atomic Lua (`reserve_and_enqueue.lua`: lock balance + `XADD`) + `1` In-Memory Match + `1` Atomic Lua (`apply_match_result.lua`: settle/refund + `XADD` fill) + `WAIT 1 50` Cross-AZ ack + `PUBLISH` reply + `3` Ledger DB rows (async) |
 | **Read: Hot State** (`OpenOrders`, `Balances`, `L2 Depth`, `RecentFills`) | `50%` | `250 RPS` | `1,250 RPS` | `1` Auth check + `1` Redis `HGETALL`/`ZRANGE` (`O(log N)`) |
 | **Read: Cold History** (`TradeHistory >5m`, `ClosedOrders`, `Klines`) | `20%` | `100 RPS` | `500 RPS` | `1` Indexed `SELECT` on Aurora PostgreSQL Read Replica (or CloudFront cache hit) |
 | **Total HTTP Ingress** | **`100%`** | **`500 RPS`** | **`2,500 RPS`** | — |
@@ -72,8 +72,8 @@ In a spot exchange like Binance, API traffic follows a known read/write distribu
   * Every write request (`150 RPS` base / `750 RPS` peak) executes:
     1. `1` unified atomic Lua script (`EVALSHA reserve_and_enqueue.lua`: atomically checks/locks balance + appends order to `stream:orders` in a single round-trip so a gateway crash can never leave orphaned locked funds),
     2. `1` stream read (`XREADGROUP`) by the Matching Engine,
-    3. `1` unified atomic Lua script (`EVALSHA apply_match_result.lua`: settles Maker/Taker balances + refunds any price-improvement surplus + appends fill to `stream:fills` + caches recent trade for Read-Your-Own-Writes + `PUBLISH`es reply to the waiting Order Gateway and WebSocket market data channel), and
-    4. `1` Cross-AZ replication barrier (`WAIT 1 50` pipelined with the fill commit) = `4 Redis operations` per order on the Hot Path (plus `1` batched `XREADGROUP`/`XACK` every `20ms` by the Settlement Worker, adding `< 0.4 ops/order`).
+    3. `1` unified atomic Lua script (`EVALSHA apply_match_result.lua`: settles Maker/Taker balances + refunds any price-improvement surplus + appends fill to `stream:fills` + caches recent trade for Read-Your-Own-Writes), and
+    4. `1` Cross-AZ replication barrier (`WAIT 1 50` executed right after `apply_match_result.lua` so the state mutation is confirmed on the Cross-AZ replica *before* firing `PUBLISH` to wake the waiting Order Gateway and WebSocket market data channel) = `4 Redis operations` per order on the Hot Path (plus `1` batched `XREADGROUP`/`XACK` every `20ms` by the Settlement Worker, adding `< 0.4 ops/order`).
   * Every hot read (`250 RPS` base / `1,250 RPS` peak) executes `1 Redis op`.
   * **Total Redis Throughput:**
     $$\text{Ops}_{\text{base}} = (150 \times 4) + 250 = \mathbf{850 \text{ ops/sec}} \quad | \quad \text{Ops}_{\text{peak}} = (750 \times 4) + 1,250 = \mathbf{4,250 \text{ ops/sec}}$$
@@ -124,7 +124,7 @@ Let us plug in the exact numbers for every component on the **Hot Path** under b
 | **2** | **Order Gateway Compute** (ECS Fargate, $S = 0.40\text{ ms}$, $\mu = 2,500/\text{vCPU}$) | `0.40 ms` | $\rho = 0.10$ | $\rho = 0.50$ | $4.605 \times \frac{0.40}{0.90} =$ **`2.05 ms`** | $4.605 \times \frac{0.40}{0.50} =$ **`3.68 ms`** |
 | **3** | **ElastiCache Redis Lua + Stream Append** ($S = 0.05\text{ ms}$ compute + `0.35 ms` VPC RTT) | `0.40 ms` | $\rho = 0.008$ | $\rho = 0.038$ | $4.605 \times \frac{0.05}{0.992} + 0.70 =$ **`0.93 ms`** | $4.605 \times \frac{0.05}{0.962} + 0.85 =$ **`1.09 ms`** |
 | **4** | **Matching Engine (`c7g.large`)** ($S = 0.05\text{ ms}$, $\mu = 20,000\text{ orders/s}$) | `0.05 ms` | $\rho = 0.0075$ | $\rho = 0.0375$ | $4.605 \times \frac{0.05}{0.9925} =$ **`0.23 ms`** | $4.605 \times \frac{0.05}{0.9625} =$ **`0.24 ms`** |
-| **5** | **Stream Return Notification & JSON Response Serialization** | `0.50 ms` | $\rho = 0.10$ | $\rho = 0.50$ | **`1.80 ms`** | **`3.10 ms`** |
+| **5** | **Cross-AZ `WAIT 1 50` Replication Ack (`~0.55 ms` RTT) + Pub/Sub Reply & JSON Serialization** | `0.50 ms` | $\rho = 0.10$ | $\rho = 0.50$ | `0.55 ms` (Cross-AZ) + `1.25 ms` = **`1.80 ms`** | `0.70 ms` (Cross-AZ) + `2.40 ms` = **`3.10 ms`** |
 | **Total** | **End-to-End `p99` Response Time** | — | — | — | **`20.01 ms` (`< 100ms` SLA)** | **`26.11 ms` (`< 100ms` SLA)** |
 
 > **Conclusion of Mathematical Proof (Comonotonic Upper Bound, Jackson Network Convolution & $G/G/c$ Volatility Headroom):**
@@ -227,8 +227,8 @@ sequenceDiagram
     GW->>Redis: EVALSHA reserve_and_enqueue.lua (Lock 30,000 USDT + XADD seq_id in 1 atomic op)
     Redis->>ME: XREADGROUP Consume Order Command (seq_id)
     ME->>ME: Match in RAM Limit Order Book (< 0.05ms, e.g. filled @ 59,000 USDT)
-    ME->>Redis: EVALSHA apply_match_result.lua + WAIT 1 50 (Credit 0.5 BTC, Refund 500 USDT, Credit Maker, XADD fill, PUBLISH gw:reply)
-    Redis-->>GW: Pub/Sub Push to gw:reply:<gw_id> (Wake up waiting coroutine by req_id)
+    ME->>Redis: EVALSHA apply_match_result.lua -> WAIT 1 50 (Cross-AZ Ack) -> PUBLISH gw:reply
+    Redis-->>GW: Pub/Sub Push to gw:reply:<gw_id> (Sent only AFTER Cross-AZ WAIT Ack succeeds)
     GW-->>Trader: 200 OK (Order Matched @ 59,000 USDT - Total ~15-26ms)
     end
 
@@ -262,17 +262,17 @@ sequenceDiagram
      * **Atomic Stream Enqueue:** Assigns a strictly monotonic sequence number (`seq_id`) and calls `redis.call('XADD', 'stream:orders', ...)` **inside the exact same Lua script execution** (`< 0.5ms`).
 3. **Deterministic In-Memory Matching (`< 50 microseconds`):**
    * The **Matching Engine (`c7g.large`)** consumes the sequenced command via `XREADGROUP` and matches it against the in-memory Red-Black Tree / B-Tree Limit Order Book.
-4. **Atomic Post-Match Balance Settlement, Price-Improvement Refund & Correlated Gateway Reply (`apply_match_result.lua` + `WAIT 1 50`):**
-   * Immediately upon matching (for example, the `60,000 USDT` limit buy matches against a resting sell order at `59,000 USDT`), the Matching Engine invokes `EVALSHA apply_match_result.lua` pipelined with `WAIT 1 50` on Redis:
+4. **Atomic Post-Match Balance Settlement, Price-Improvement Refund, Cross-AZ Replication Barrier & Correlated Gateway Reply (`apply_match_result.lua` -> `WAIT 1 50` -> `PUBLISH`):**
+   * Immediately upon matching (for example, the `60,000 USDT` limit buy matches against a resting sell order at `59,000 USDT`), the Matching Engine invokes `EVALSHA apply_match_result.lua` on Redis:
      * **Fencing Verification:** Verifies `args.leader_epoch >= redis.get('current_leader_epoch')`, aborting if stale.
      * **Real-Time Taker & Maker Balance Update + Price-Improvement Refund:** Deducts `30,000 USDT` from the buyer's `locked_USDT`, **immediately refunds the `500 USDT` price-improvement savings** (`(60,000 - 59,000) * 0.5`) back to the buyer's `available_USDT`, credits `+0.5 BTC` (minus fee) to the buyer's `available_BTC`, and credits `+29,500 USDT` (minus fee) to the seller's `available_USDT`. Both traders can immediately use their new balances on their very next millisecond request!
      * **Read-Your-Own-Writes Cache & Durable Fill Stream:** Appends the fill event to `stream:fills` and pushes a compact record to `user:{id}:recent_fills` (5-minute TTL ring buffer) so immediate calls to `GET /api/v1/myTrades` or `OpenOrders` reflect the trade with **zero replication lag** while Aurora settles asynchronously.
-     * **Correlated Gateway Wakeup & Market Broadcast:** Executes `redis.call('PUBLISH', 'gw:reply:' .. gw_id, payload)` and `redis.call('PUBLISH', 'md:' .. symbol, tick)`, followed by `WAIT 1 50` (`~0.5ms` Cross-AZ memory replication acknowledgment).
-   * The waiting **Order Gateway** coroutine wakes up upon receiving the `gw:reply:{gw_id}` payload and returns HTTP `200 OK` to the trader. Total end-to-end elapsed time: **`~15–26ms`**.
+     * **Cross-AZ Replication Barrier Before Gateway Wakeup (`WAIT 1 50` -> `PUBLISH`):** Crucially, `PUBLISH` is **not** called inside `apply_match_result.lua` before replication completes (otherwise Redis Pub/Sub would wake the Order Gateway and return HTTP `200 OK` to the client *before* the state mutation is replicated to the standby AZ). Instead, the command pipeline executes `EVALSHA apply_match_result.lua`, blocks on `WAIT 1 50` (`~0.5ms` Cross-AZ memory replication acknowledgment), and **only after `WAIT 1 50` confirms that at least 1 Cross-AZ replica has acknowledged the write offset** does it execute `PUBLISH gw:reply:{gw_id}` and `PUBLISH md:{symbol}`.
+   * The waiting **Order Gateway** coroutine wakes up upon receiving the `gw:reply:{gw_id}` payload and returns HTTP `200 OK` to the trader, guaranteeing that every acknowledged `200 OK` trade has already survived Cross-AZ replication. Total end-to-end elapsed time: **`~15–26ms`**.
 
 ### 4.2. Asynchronous Settlement, Poison-Pill Isolation & Read-Your-Own-Writes (`Cold Path`)
 1. **Settlement Workers (ECS Fargate)** consume `OrderFilled` and `OrderCanceled` events from `stream:fills` via `XREADGROUP` in micro-batches (every `20ms` or `100 events`).
-2. They execute an idempotent ACID transaction (keyed by `(leader_epoch, seq_id)`) on **Amazon Aurora PostgreSQL**, recording the double-entry journal rows (`debit buyer USDT`, `credit seller USDT`, `debit seller BTC`, `credit buyer BTC`) and updating the `orders` and `balances` tables before calling `XACK`.
+2. They execute an idempotent ACID transaction (keyed by `(leader_epoch, seq_id)`) on **Amazon Aurora PostgreSQL**, recording the complete 6-legged double-entry journal rows (`debit buyer gross USDT`, `credit seller net USDT`, `credit exchange_fee_treasury fee USDT`, `debit seller gross BTC`, `credit buyer net BTC`, `credit exchange_fee_treasury fee BTC`) and updating the `orders` and `balances` tables before calling `XACK`.
 3. **Poison-Pill / Partial-Batch Failure Isolation:** If a micro-batch of 100 events encounters an unexpected SQL constraint error, the Settlement Worker falls back to per-event `SAVEPOINT` execution within the batch, commits all valid events, and routes any malformed event to a **Dead-Letter Stream (`stream:settlement_dlq`)** while firing a P1 CloudWatch alarm—ensuring a single bad event can never block the settlement pipeline.
 4. **Read-Your-Own-Writes (RYOW) Consistency:** When a trader queries recent trades or orders, the Order Gateway merges the 5-minute hot ring buffer in Redis (`user:{id}:recent_fills`) with historical pages from the **Aurora Read Replica**, eliminating the `20–40ms` window between Redis execution and Aurora Read Replica replication.
 
@@ -283,7 +283,8 @@ sequenceDiagram
   * We run a **Primary Matching Engine (`c7g.large` in AZ-a)** and a **Warm Standby (`c7g.large` in AZ-b)**. Both consume the exact same ordered command stream (`stream:orders`). Since the matching logic is 100% deterministic (pure function of `seq_id` inputs), the Warm Standby maintains an identical in-memory Order Book in real time.
   * **Strongly-Consistent Lease & Split-Brain Protection via Amazon DynamoDB (`leader_epoch` Fencing):**
     * Relying on async-replicated Redis for leader election risks split-brain during a Redis failover, and using Aurora risks lease timeouts during DB maintenance. Instead, leader coordination uses a single **Amazon DynamoDB** table (`exchange_leader_lease`, On-Demand mode, `< $2/month`), which provides Paxos-backed Multi-AZ strong consistency.
-    * The Primary node renews a conditional lease every `1 second` (`TTL = 3s`) using `UpdateItem` with `ConditionExpression: leader_epoch = :curr`. If the Primary dies or suffers a network partition, the Warm Standby executes a conditional write incrementing `leader_epoch = :curr + 1`, syncs the new `current_leader_epoch` into Redis, and begins publishing execution outputs within **2–3 seconds**. Both Redis (`apply_match_result.lua`) and Aurora Settlement Workers reject any fill carrying `leader_epoch < current_leader_epoch`, mathematically preventing dual-master split-brain.
+    * The Primary node renews a conditional lease every `500ms` (`lease_duration = 1,500ms`) using `UpdateItem` with `ConditionExpression: leader_epoch = :curr`. If the Primary dies or suffers a network partition, the Warm Standby executes a conditional write incrementing `leader_epoch = :curr + 1`, syncs the new `current_leader_epoch` into Redis, and begins publishing execution outputs within **1.5–2.0 seconds**. Both Redis (`apply_match_result.lua`) and Aurora Settlement Workers reject any fill carrying `leader_epoch < current_leader_epoch`, mathematically preventing dual-master split-brain.
+    * **Idempotent Client Reconciliation During the 1.5s Failover Window:** If an order was already enqueued into `stream:orders` right as the Primary died, the Order Gateway's `80ms` fast-fail SLA timer returns HTTP `202 Accepted (Pending Execution)` / `503 Retry-After` with the deterministic `client_order_id`. When the Warm Standby takes over `1.5s` later, it deterministically processes that unacknowledged stream entry (`XAUTOCLAIM`), and any client retry using the same `client_order_id` hits the idempotency check in `reserve_and_enqueue.lua`—returning the exact execution status without double-locking funds or creating duplicate orders.
   * **Periodic Order Book Snapshots for Resting Multi-Day GTC Orders (Cold-Boot Recovery):**
     * Because the Redis Stream keeps a rolling 24-hour buffer (`3.88 GB`), what happens to **Good-Till-Canceled (GTC) limit orders** placed days or weeks ago if both Matching Engine instances ever restart simultaneously?
     * Every **60 seconds** (and on `SIGTERM` graceful shutdown), the **Warm Standby** serializes a binary snapshot of the in-memory Order Book (tagged with `snapshot_seq_id`) to **Amazon S3** (and local EBS) without impacting the Active node's latency. On a cold boot, a new Matching Engine loads the latest S3 snapshot in `< 50ms` and replays only the delta events (`seq_id > snapshot_seq_id`) from the Redis Stream, restoring 100% of historical resting GTC orders in under 1 second.

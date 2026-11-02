@@ -4,8 +4,9 @@ RUN apk add --no-cache tini
 
 WORKDIR /app
 
-COPY --chown=node:node package.json ./
-RUN npm install --omit=dev && npm cache clean --force
+COPY --chown=node:node package*.json ./
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi \
+  && npm cache clean --force
 
 COPY --chown=node:node src ./src
 

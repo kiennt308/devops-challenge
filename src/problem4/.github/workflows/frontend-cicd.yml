@@ -78,7 +78,6 @@ jobs:
         run: npm test -- --run
 
       - name: Build production SPA bundle
-        if: inputs.rollback_release_sha == ''
         working-directory: ${{ env.WORKING_DIR }}
         env:
           # Runtime config is loaded via /config.json per environment so the compiled
@@ -87,7 +86,6 @@ jobs:
         run: npm run build
 
       - name: Upload compiled dist/ artifact
-        if: inputs.rollback_release_sha == ''
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist-${{ github.sha }}

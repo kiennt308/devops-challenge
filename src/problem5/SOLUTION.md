@@ -66,8 +66,8 @@ flowchart LR
         %% 5. AIR-GAPPED CORE TIER
         subgraph IsolatedSubnet ["Zone C: Air-Gapped Isolated Subnets (No IGW / No NAT GW)"]
             Redis["ElastiCache Redis 7\n[CHANGED] TLS In-Transit + KMS At-Rest,\nRedis ACLs (EVALSHA Only for GW)"]
-            MatchActive["Matching Engine (Active c7g.xlarge)\n[CHANGED] Upgraded to 4 vCPUs for Nitro Enclave,\nIMDSv2 Hop=1, Verifies Client Ed25519 + Signs Fills"]
-            MatchStandby["Matching Engine (Warm Standby c7g.xlarge)\n[CHANGED] Identical PCR0 Enclave\n+ Canonical Hash Chain Replay"]
+            MatchActive["Matching Engine (Active c7g.xlarge)\n[CHANGED] Parent vCPU vsock-proxy +\nNitro Enclave (Ed25519 Verify & Fill Sign)"]
+            MatchStandby["Matching Engine (Warm Standby c7g.xlarge)\n[CHANGED] Parent vCPU vsock-proxy +\nIdentical PCR0 Enclave Replay"]
             DynamoLease[("DynamoDB Leader Lease\n[ADDED] Strongly-Consistent\nConditional Epoch Fencing")]
             AuroraW[("Aurora Postgres Writer\n[CHANGED] IAM DB Auth, KMS,\nPer-Asset Statement Trigger")]
             AuroraR[("Aurora Read Replica\n[CHANGED] pgaudit Enabled")]
@@ -85,15 +85,16 @@ flowchart LR
     CF -- "WSS + X-Origin-Secret" --> NLB
     Bot -- "Direct Regional HTTPS/WSS" --> WAF
     WAF --> ALB
-    WAF --> NLB
+    Bot -- "Allowlisted IP + mTLS WSS" --> NLB
     ALB --> OrderGW
+    ALB --> WsGW
     NLB --> WsGW
 
     OrderGW -- "TLS + Redis ACL (order_gw_user)" --> Redis
-    Redis -- "Signed Command (seq_id + client_ed25519_sig)" --> MatchActive
-    Redis -. "Signed Replay" .-> MatchStandby
+    Redis -- "Signed Command via Host AF_VSOCK Proxy" --> MatchActive
+    Redis -. "Signed Replay via Host AF_VSOCK Proxy" .-> MatchStandby
     MatchActive <--> DynamoLease
-    MatchActive -- "Enclave-Signed Fill Event" --> Redis
+    MatchActive -- "Enclave-Signed Fill Event (via AF_VSOCK)" --> Redis
     Redis --> WsGW
     Redis --> Settle
     Settle -- "IAM Token Auth + TLS" --> AuroraW
@@ -128,18 +129,18 @@ The most catastrophic risk in an exchange is an insider threat or a compromised 
      * `order_gw_user`: Allowed **only** to execute `EVALSHA` (the pre-loaded atomic `reserve_and_enqueue.lua` script) and `SUBSCRIBE` on `gw:reply:*`. It **cannot** run raw `HSET`, `SET`, `DEL`, `FLUSHALL`, `CONFIG`, or `KEYS`.
      * `matching_engine_user`: Allowed **only** to `XREADGROUP` from `stream:orders`, execute `EVALSHA` (`apply_match_result.lua`), `WAIT`, and `PUBLISH` to `gw:reply:*` / `md:*`.
      * `ws_gw_user`: Strictly **read-only** (`SUBSCRIBE` / `ZRANGE` on public order book keys); zero access to `user:*` balance hashes.
-2. **`[ADDED]` End-to-End `Ed25519` Verification, Canonical Hash-Chaining & KMS PCR0 Attestation:**
-   * **Why a Compromised Order Gateway Cannot Forge Orders:** Because users sign orders with asymmetric **`Ed25519` private keys** and the exchange only stores their public keys, even if an attacker compromises an **Order Gateway** container and steals its internal `gw_hmac` key, they **cannot forge a valid `client_ed25519_sig`** for any user.
-   * **Canonical Deterministic Hash Chain Across Failover:** When the **Matching Engine (`c7g.xlarge` — upgraded from Problem 1's `c7g.large` to meet AWS Nitro Enclaves' 4-vCPU minimum hardware requirement, adding ~$105/month across Active + Warm Standby)** inside its **AWS Nitro Enclave** verifies `client_ed25519_sig` and produces an `OrderFilled` event, it computes a deterministic state hash:
+2. **`[ADDED]` End-to-End `Ed25519` Verification, Attested Public-Key Binding, Canonical Hash-Chaining & KMS PCR0 Attestation:**
+   * **Why a Compromised Order Gateway Cannot Forge Orders or Spoof User Public Keys:** Because users sign orders with asymmetric **`Ed25519` private keys** and the exchange only stores their public keys, even if an attacker compromises an **Order Gateway** container and steals its internal `gw_hmac` key, they **cannot forge a valid `client_ed25519_sig`** for any user. Furthermore, to prevent a compromised Order Gateway or Redis instance from swapping a victim's `user_id -> ed25519_pubkey` mapping, every registered user API key is bound by a **KMS-signed Key Certificate** (`kms_sig(user_id, ed25519_pubkey, key_version)`) issued during Passkey/WebAuthn MFA registration. The Nitro Enclave embeds the immutable Security Account KMS Public Key inside its attested `.eif` image (`PCR0`) and verifies `kms_sig(user_id, ed25519_pubkey)` before caching the user's public key in Enclave RAM—making key-substitution attacks impossible.
+   * **Canonical Deterministic Hash Chain Across Failover & Local `AF_VSOCK` Bridge:** Because AWS Nitro Enclaves have no external TCP/IP network interface by design, a lightweight parent forwarder (`vsock-proxy`) running on the 2 host vCPUs of `c7g.xlarge` bridges the Redis Stream (`XREADGROUP` / `EVALSHA`) and DynamoDB lease checks over a local in-memory `AF_VSOCK` channel into the 2 dedicated Enclave vCPUs (`< 0.3ms` IPC overhead). When the **Matching Engine (`c7g.xlarge` — upgraded from Problem 1's `c7g.large` to meet AWS Nitro Enclaves' 4-vCPU minimum hardware requirement, adding ~$105/month across Active + Warm Standby)** inside its **AWS Nitro Enclave** verifies `client_ed25519_sig` and produces an `OrderFilled` event, it computes a deterministic state hash:
      $$\text{fill\_hash}_{n} = \text{SHA256}(\text{fill\_hash}_{n-1} \parallel \text{seq\_id}_{n} \parallel \text{canonical\_fill\_payload}_{n})$$
      Crucially, `fill_hash` depends **only** on the deterministic order sequence and canonical fill data (excluding `leader_epoch` or wall-clock timestamps from the inner hash), and the Enclave then signs `(leader_epoch, seq_id, fill_hash)` using its attested private key. Because both Active and Warm-Standby replay the exact same `seq_id` stream, the Warm Standby's in-memory `fill_hash` is 100% identical to the Active node's at every `seq_id`, guaranteeing zero hash-chain forks when failing over to `leader_epoch + 1`.
    * **Cross-Account KMS Key Governance & M-of-N PCR0 Quorum:** Both Active and Warm-Standby Enclaves are built from the same reproducible Enclave Image File (`.eif`). The Master KMS Key lives in the **Dedicated Security Account** and restricts `kms:Decrypt` via `kms:RecipientAttestation:ImageSha384 == <PCR0_HASH>`. An **AWS Organizations Service Control Policy (SCP)** blocks `kms:PutKeyPolicy` and `kms:ScheduleKeyDeletion` unless approved by an **M-of-N multi-party quorum**, preventing a compromised CI/CD role or rogue admin from substituting a backdoored `<PCR0_HASH>`.
    * Before the **Settlement Worker** commits a balance credit to **Aurora PostgreSQL**, it verifies the Matching Engine's enclave signature, the active `leader_epoch`, and the monotonic `seq_id`.
-3. **`[CHANGED]` Immutable Double-Entry Ledger Enforcement in Aurora PostgreSQL (Per-Asset Statement Trigger):**
+3. **`[CHANGED]` Immutable Double-Entry Ledger Enforcement in Aurora PostgreSQL (Per-Asset Statement Trigger with Fee-Treasury Legs):**
    * **IAM Database Authentication (with Pooled Background Refresh):** Settlement Workers authenticate to Aurora using short-lived (15-minute) **RDS IAM tokens** instead of static database passwords, rotating tokens asynchronously in the connection pool background (staying well under RDS IAM's 200 new connections/sec limit).
-   * **Append-Only Permissions & Per-Asset Statement-Level Transition Table Trigger:** The `settlement_worker` PostgreSQL role is granted `INSERT, SELECT` on `ledger_entries` (and **explicitly denied `UPDATE, DELETE, TRUNCATE`**). Rather than using a `FOR EACH ROW` constraint trigger (which would fire hundreds of times per batch and risk cross-asset inflation if not grouped by currency), we use a PostgreSQL **Statement-Level Trigger with Transition Tables (`AFTER INSERT ON ledger_entries REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT`)** that executes **strictly once per `20ms` micro-batch `INSERT`** over only the newly inserted rows in RAM and enforces the zero-sum accounting invariant **grouped by each individual asset (`GROUP BY asset`)**:
-     $$\forall \text{asset} \in \{\text{BTC}, \text{ETH}, \text{USDT}, \dots\}: \quad \sum_{\text{new\_rows, asset}} \text{Debits} - \sum_{\text{new\_rows, asset}} \text{Credits} = 0$$
-     This mathematically prevents both unbacked currency creation and cross-asset substitution attacks (e.g., debiting `100 USDT` to credit `100 BTC`).
+   * **Append-Only Permissions & Per-Asset Statement-Level Transition Table Trigger:** The `settlement_worker` PostgreSQL role is granted `INSERT, SELECT` on `ledger_entries` (and **explicitly denied `UPDATE, DELETE, TRUNCATE`**). Every matched trade explicitly records **all 6 double-entry journal legs**—debiting the gross amount from Buyer (`USDT`) and Seller (`BTC`), crediting the net proceeds (`gross - fee`) to Seller (`USDT`) and Buyer (`BTC`), and crediting the exact Maker/Taker fees (`fee_USDT`, `fee_BTC`) to the `exchange_fee_treasury` account. Rather than using a `FOR EACH ROW` constraint trigger (which would fire hundreds of times per batch and risk cross-asset inflation if not grouped by currency), we use a PostgreSQL **Statement-Level Trigger with Transition Tables (`AFTER INSERT ON ledger_entries REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT`)** that executes **strictly once per `20ms` micro-batch `INSERT`** over only the newly inserted rows in RAM and enforces the zero-sum accounting invariant **grouped by each individual asset (`GROUP BY asset`)**:
+     $$\forall \text{asset} \in \{\text{BTC}, \text{ETH}, \text{USDT}, \dots\}: \quad \sum_{\text{new\_rows, asset}} \text{Debits} - \sum_{\text{new\_rows, asset}} \left(\text{Credits}_{\text{traders}} + \text{Credits}_{\text{fee\_treasury}}\right) = 0$$
+     This guarantees that `Debits` equal `Credits` down to the 18th decimal place (`NUMERIC(36,18)`) even when trading fees are deducted, mathematically preventing both unbacked currency creation and cross-asset substitution attacks (e.g., debiting `100 USDT` to credit `100 BTC`).
 
 ### 4.4. Multi-Account Immutable Audit Trail (`S3 Object Lock WORM`)
 * **`[CHANGED]` Cross-Account Write-Only Audit Archive:**
